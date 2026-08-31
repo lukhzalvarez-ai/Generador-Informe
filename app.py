@@ -22,6 +22,7 @@ Community Cloud (GitHub).
 import io
 import re
 import logging
+from pathlib import Path
 
 import streamlit as st
 import pandas as pd
@@ -110,6 +111,24 @@ ETIQUETAS_BLOQUE_DIAGNOSTICO = {
 }
 
 EXTENSIONES_IMAGEN = {"jpg", "jpeg", "png"}
+
+# Plantilla predeterminada: se busca junto a este archivo (app.py) en el
+# repositorio. Así no hace falta adjuntarla en cada uso; solo se necesita
+# subir una plantilla distinta si en algún caso puntual se quiere usar otra.
+TEMPLATE_FILENAME = "Reporte_de_falla_Astara.xlsx"
+TEMPLATE_PATH = Path(__file__).resolve().parent / TEMPLATE_FILENAME
+
+
+def cargar_plantilla_predeterminada() -> bytes:
+    """Devuelve los bytes de la plantilla incluida en el repositorio,
+    o None si no está presente."""
+    if not TEMPLATE_PATH.exists():
+        return None
+    try:
+        return TEMPLATE_PATH.read_bytes()
+    except Exception as e:
+        logger.error(f"No se pudo leer la plantilla predeterminada: {e}")
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -325,9 +344,12 @@ def clasificar_pdf(texto: str, nombre: str) -> str:
 
 
 def clasificar_archivos_subidos(archivos_subidos: list) -> dict:
-    """Recibe la lista de UploadedFile del campo único y los separa en:
-    plantilla Excel, PDF Orden de Trabajo, PDF Garantías e imágenes,
-    deduplicando imágenes por nombre (case-insensitive)."""
+    """Recibe la lista de UploadedFile del campo único (puede venir vacía)
+    y los separa en: plantilla Excel (opcional; si no se sube ninguna se
+    usa la plantilla predeterminada incluida en el repositorio), PDF Orden
+    de Trabajo, PDF Garantías e imágenes, deduplicando imágenes por nombre
+    (case-insensitive). Ningún archivo es obligatorio: lo que no se
+    encuentre queda simplemente sin aportar datos."""
     resultado = {
         "excel_template": None,
         "pdf_orden": None,
@@ -443,7 +465,10 @@ def insertar_imagenes(ws, archivos_imagenes: list) -> int:
 # --------------------------------------------------------------------------
 def generar_reporte(clasificacion: dict) -> tuple:
     """Ejecuta todo el flujo y devuelve (bytes_excel, valores, faltantes,
-    n_imagenes_insertadas)."""
+    n_imagenes_insertadas). Ningún archivo es obligatorio: si falta la
+    Orden de Trabajo, el de Garantías, fotos o incluso la plantilla
+    (se usa la predeterminada del repositorio en ese caso), el reporte
+    se genera igual dejando en blanco lo que no se pudo obtener."""
     datos_ot = extraer_datos_pdf(clasificacion["pdf_orden"] or "")
     datos_garantias = extraer_datos_from_garantias_pdf(clasificacion["pdf_garantias"] or "")
 
@@ -462,7 +487,15 @@ def generar_reporte(clasificacion: dict) -> tuple:
     }
     faltantes = validar_campos_criticos(valores)
 
-    wb = openpyxl.load_workbook(io.BytesIO(clasificacion["excel_template"]))
+    plantilla_bytes = clasificacion["excel_template"] or cargar_plantilla_predeterminada()
+    if not plantilla_bytes:
+        raise RuntimeError(
+            f"No se encontró la plantilla predeterminada ('{TEMPLATE_FILENAME}') junto a la app "
+            "y tampoco se adjuntó una plantilla .xlsx. Sube una plantilla o agrega el archivo "
+            f"'{TEMPLATE_FILENAME}' al repositorio."
+        )
+
+    wb = openpyxl.load_workbook(io.BytesIO(plantilla_bytes))
     ws = wb.active
 
     for campo, celda in CELDAS_EXCEL.items():
@@ -556,111 +589,111 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+PLANTILLA_PREDETERMINADA_DISPONIBLE = cargar_plantilla_predeterminada() is not None
+
 with st.sidebar:
     st.markdown("### ℹ️ Cómo usar la app")
     st.markdown(
         """
-        1. Arrastra **todos** tus archivos al campo de carga:
+        1. Arrastra los archivos que tengas al campo de carga (ninguno es
+           obligatorio, usa los que tengas a mano):
            - `Orden de Trabajo.pdf`
            - `Trabajo en Garantías.pdf`
-           - `Reporte Técnico Astara.xlsx` (plantilla)
            - Fotos del vehículo (`.jpg`, `.jpeg`, `.png`)
-        2. La app detecta sola qué es cada archivo.
-        3. Revisa la vista previa de los datos importados.
-        4. Descarga el reporte final ya rellenado.
+        2. La plantilla del **Reporte Técnico Astara ya viene integrada**,
+           no hace falta adjuntarla (solo si quieres usar una distinta a
+           la de siempre).
+        3. La app detecta sola qué es cada archivo que subas.
+        4. Genera el reporte: lo que no se haya adjuntado queda en blanco
+           para completar a mano.
+        5. Revisa la vista previa y descarga el reporte final.
         """
     )
     st.divider()
     st.caption("No es necesario un campo por tipo de archivo: todo se sube junto y la app los diferencia automáticamente.")
+    if not PLANTILLA_PREDETERMINADA_DISPONIBLE:
+        st.error(f"No se encontró '{TEMPLATE_FILENAME}' junto a la app. Agrégalo al repositorio o súbelo manualmente en el campo de carga.")
 
 archivos_subidos = st.file_uploader(
-    "Adjunta aquí la Orden de Trabajo, el Trabajo en Garantías, la plantilla del Reporte Técnico Astara y las fotos",
+    "Adjunta aquí lo que tengas: Orden de Trabajo, Trabajo en Garantías y/o fotos (todo opcional)",
     type=["pdf", "xlsx", "jpg", "jpeg", "png"],
     accept_multiple_files=True,
 )
 
-if archivos_subidos:
-    clasificacion = clasificar_archivos_subidos(archivos_subidos)
+clasificacion = clasificar_archivos_subidos(archivos_subidos or [])
 
-    st.markdown("#### 📎 Archivos detectados")
-    badges = []
-    badges.append(
-        f'<span class="astara-badge {"ok" if clasificacion["excel_template"] else "missing"}">'
-        f'Plantilla Excel: {"✔ detectada" if clasificacion["excel_template"] else "✘ falta"}</span>'
-    )
-    badges.append(
-        f'<span class="astara-badge {"ok" if clasificacion["pdf_orden"] else "missing"}">'
-        f'Orden de Trabajo: {clasificacion["pdf_orden_nombre"] or "✘ falta"}</span>'
-    )
-    badges.append(
-        f'<span class="astara-badge {"ok" if clasificacion["pdf_garantias"] else "missing"}">'
-        f'Trabajo en Garantías: {clasificacion["pdf_garantias_nombre"] or "✘ falta"}</span>'
-    )
-    badges.append(f'<span class="astara-badge ok">Fotos: {len(clasificacion["imagenes"])}</span>')
-    st.markdown(" ".join(badges), unsafe_allow_html=True)
-
-    if clasificacion["sin_clasificar"]:
-        st.warning("Archivos que no se pudieron clasificar y fueron ignorados: " + ", ".join(clasificacion["sin_clasificar"]))
-
-    faltan_obligatorios = not (clasificacion["excel_template"] and clasificacion["pdf_orden"] and clasificacion["pdf_garantias"])
-
-    if faltan_obligatorios:
-        st.info("Sube la plantilla Excel, la Orden de Trabajo y el Trabajo en Garantías para poder generar el reporte.")
-    else:
-        generar = st.button("⚙️ Generar Reporte Técnico Astara", type="primary", use_container_width=True)
-
-        if generar:
-            with st.spinner("Extrayendo datos y armando el reporte..."):
-                try:
-                    excel_bytes, valores, faltantes, n_insertadas = generar_reporte(clasificacion)
-                except Exception as e:
-                    st.error(f"No se pudo generar el reporte: {e}")
-                    logger.error(f"Error generando el reporte: {e}")
-                    excel_bytes = None
-
-            if excel_bytes:
-                if faltantes:
-                    etiquetas_faltantes = ", ".join(ETIQUETAS_CAMPOS.get(c, c) for c in faltantes)
-                    st.warning(f"⚠ Algunos campos críticos quedaron vacíos y conviene revisarlos a mano: {etiquetas_faltantes}")
-                else:
-                    st.success("Todos los campos críticos se completaron correctamente.")
-
-                st.markdown("#### 👀 Vista previa de los datos importados al Excel")
-                df_preview = pd.DataFrame(
-                    [
-                        {
-                            "Campo": ETIQUETAS_CAMPOS.get(campo, campo),
-                            "Celda": celda,
-                            "Valor importado": valores.get(campo, "") or "—",
-                        }
-                        for campo, celda in CELDAS_EXCEL.items()
-                    ]
-                )
-                st.dataframe(df_preview, use_container_width=True, hide_index=True)
-
-                if clasificacion["imagenes"]:
-                    st.markdown(f"#### 🖼️ Fotos insertadas en el reporte ({n_insertadas}/{len(clasificacion['imagenes'])})")
-                    columnas = st.columns(4)
-                    for i, archivo in enumerate(clasificacion["imagenes"]):
-                        with columnas[i % 4]:
-                            st.image(archivo.getvalue(), caption=f"{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
-
-                st.markdown("#### ⬇️ Descargar reporte final")
-                st.download_button(
-                    label="Descargar 'Reporte de falla Astara.xlsx'",
-                    data=excel_bytes,
-                    file_name="Reporte de falla Astara.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    type="primary",
-                    use_container_width=True,
-                )
+st.markdown("#### 📎 Archivos detectados")
+badges = []
+if clasificacion["excel_template"]:
+    badges.append('<span class="astara-badge ok">Plantilla: ✔ personalizada cargada</span>')
+elif PLANTILLA_PREDETERMINADA_DISPONIBLE:
+    badges.append('<span class="astara-badge ok">Plantilla: ✔ predeterminada integrada</span>')
 else:
-    st.markdown(
-        """
-        <div class="astara-card">
-        Aún no se han cargado archivos. Sube todos los documentos en el campo de arriba
-        para comenzar.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    badges.append('<span class="astara-badge missing">Plantilla: ✘ no disponible</span>')
+badges.append(
+    f'<span class="astara-badge {"ok" if clasificacion["pdf_orden"] else "warn"}">'
+    f'Orden de Trabajo: {clasificacion["pdf_orden_nombre"] or "no adjuntada"}</span>'
+)
+badges.append(
+    f'<span class="astara-badge {"ok" if clasificacion["pdf_garantias"] else "warn"}">'
+    f'Trabajo en Garantías: {clasificacion["pdf_garantias_nombre"] or "no adjuntada"}</span>'
+)
+badges.append(
+    f'<span class="astara-badge {"ok" if clasificacion["imagenes"] else "warn"}">'
+    f'Fotos: {len(clasificacion["imagenes"])}</span>'
+)
+st.markdown(" ".join(badges), unsafe_allow_html=True)
+st.caption("Nada es obligatorio: lo que no adjuntes simplemente queda vacío en el reporte para completarlo a mano.")
+
+if clasificacion["sin_clasificar"]:
+    st.warning("Archivos que no se pudieron clasificar y fueron ignorados: " + ", ".join(clasificacion["sin_clasificar"]))
+
+generar = st.button("⚙️ Generar Reporte Técnico Astara", type="primary", use_container_width=True)
+
+if generar:
+    with st.spinner("Extrayendo datos y armando el reporte..."):
+        try:
+            excel_bytes, valores, faltantes, n_insertadas = generar_reporte(clasificacion)
+        except Exception as e:
+            st.error(f"No se pudo generar el reporte: {e}")
+            logger.error(f"Error generando el reporte: {e}")
+            excel_bytes = None
+
+    if excel_bytes:
+        if faltantes:
+            etiquetas_faltantes = ", ".join(ETIQUETAS_CAMPOS.get(c, c) for c in faltantes)
+            st.warning(f"⚠ Algunos campos críticos quedaron vacíos (por falta de archivos o de datos legibles) y conviene revisarlos a mano: {etiquetas_faltantes}")
+        else:
+            st.success("Todos los campos críticos se completaron correctamente.")
+
+        st.markdown("#### 👀 Vista previa de los datos importados al Excel")
+        df_preview = pd.DataFrame(
+            [
+                {
+                    "Campo": ETIQUETAS_CAMPOS.get(campo, campo),
+                    "Celda": celda,
+                    "Valor importado": valores.get(campo, "") or "—",
+                }
+                for campo, celda in CELDAS_EXCEL.items()
+            ]
+        )
+        st.dataframe(df_preview, use_container_width=True, hide_index=True)
+
+        if clasificacion["imagenes"]:
+            st.markdown(f"#### 🖼️ Fotos insertadas en el reporte ({n_insertadas}/{len(clasificacion['imagenes'])})")
+            columnas = st.columns(4)
+            for i, archivo in enumerate(clasificacion["imagenes"]):
+                with columnas[i % 4]:
+                    st.image(archivo.getvalue(), caption=f"{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
+        else:
+            st.info("No se adjuntaron fotos; el reporte queda sin imágenes insertadas.")
+
+        st.markdown("#### ⬇️ Descargar reporte final")
+        st.download_button(
+            label="Descargar 'Reporte de falla Astara.xlsx'",
+            data=excel_bytes,
+            file_name="Reporte de falla Astara.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
