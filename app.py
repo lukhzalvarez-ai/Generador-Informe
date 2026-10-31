@@ -17,6 +17,18 @@ Garantías, etc.). Lo único que cambia es el manejo de archivos:
 en vez de rutas fijas en disco, se trabaja en memoria (BytesIO)
 para que la app funcione igual en local (.bat) o en Streamlit
 Community Cloud (GitHub).
+
+Control de peso del reporte (v2)
+--------------------------------
+El Excel final nunca supera los 25 MB, sin importar cuántas fotos se
+adjunten (hasta ~25 o más):
+  - Las 2 PRIMERAS fotos se guardan siempre con alta calidad.
+  - Las demás se guardan con la misma calidad mientras el total quepa
+    en el límite; solo si no cabe, se comprimen por niveles (resolución
+    y calidad JPEG) hasta que el reporte quede bajo el límite.
+  - Únicamente en un caso extremo (que ni con las secundarias al mínimo
+    quepa) se reducen también las 2 primeras.
+  - Al final se verifica el tamaño REAL del .xlsx guardado.
 """
 
 import io
@@ -40,6 +52,9 @@ except ImportError:
     except ImportError:
         PDF_LIBRARY_AVAILABLE = False
 
+# Evita el aviso de "decompression bomb" con fotos de cámaras de alta resolución
+PILImage.MAX_IMAGE_PIXELS = 200_000_000
+
 # --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
@@ -56,6 +71,35 @@ TARGET_HEIGHT = int(5.69 * CM_TO_PX_96DPI)
 IMG_START_ROW = 28
 IMG_ROW_INCREMENT = 11
 IMG_COLUMNS = ("C", "G")
+
+# --------------------------------------------------------------------------
+# Control de peso del reporte
+# --------------------------------------------------------------------------
+MB = 1024 * 1024
+LIMITE_REPORTE_BYTES = 25 * MB          # límite duro solicitado
+OBJETIVO_REPORTE_BYTES = int(24.0 * MB)  # se apunta un poco más abajo como margen de seguridad
+N_FOTOS_PRIORITARIAS = 2                 # las 2 primeras fotos priorizan calidad
+
+# (lado máximo en px, calidad JPEG). El nivel 0 equivale a la calidad
+# original de la app (resolución completa, calidad 88).
+NIVELES_PRIORITARIAS = [
+    (4096, 92),
+    (3200, 90),
+    (2560, 88),
+    (2048, 85),
+]
+NIVELES_SECUNDARIAS = [
+    (4096, 88),   # sin ahorro: igual que antes
+    (3000, 85),
+    (2400, 83),
+    (2000, 80),
+    (1600, 78),
+    (1366, 75),
+    (1152, 72),
+    (1024, 68),
+    (900, 64),
+    (800, 60),
+]
 
 CELDAS_EXCEL = {
     "vin": "G5",
@@ -410,7 +454,7 @@ def clasificar_archivos_subidos(archivos_subidos: list) -> dict:
 
 
 # --------------------------------------------------------------------------
-# Imágenes
+# Imágenes — preparación y compresión adaptativa
 # --------------------------------------------------------------------------
 def calcular_celda_imagen(indice: int) -> str:
     fila = IMG_START_ROW + (indice // len(IMG_COLUMNS)) * IMG_ROW_INCREMENT
@@ -418,57 +462,167 @@ def calcular_celda_imagen(indice: int) -> str:
     return f"{columna}{fila}"
 
 
-def preparar_imagen(archivo_subido) -> io.BytesIO:
-    """Aplica la misma transformación que el script original
-    (orientación EXIF, RGBA->RGB, rotación si es vertical) y devuelve
-    un buffer JPEG en memoria listo para insertar.
+def _abrir_normalizada(datos: bytes, lado_max: int) -> PILImage.Image:
+    """Abre la imagen y aplica la misma transformación que el script
+    original (orientación EXIF, conversión a RGB, rotación si es vertical),
+    reduciéndola a 'lado_max' px en su lado más largo si es más grande.
 
-    Importante: openpyxl necesita reabrir la imagen desde un archivo
-    o un buffer (usa 'fp' internamente al guardar), así que no basta
-    con pasarle el objeto PIL ya transformado -eso rompe el guardado-;
-    por eso el resultado se vuelca a un BytesIO en vez de devolver el
-    objeto PIL directamente."""
-    pil_img = PILImage.open(io.BytesIO(archivo_subido.getvalue()))
-    pil_img = ImageOps.exif_transpose(pil_img)
-    if pil_img.mode == "RGBA":
-        pil_img = pil_img.convert("RGB")
-    width, height = pil_img.size
+    Se usa draft() para que, en JPEG, el decodificador lea directamente a
+    una escala menor cuando se va a reducir: ahorra mucha RAM y tiempo con
+    fotos de celular de 12-50 MP (importante en Streamlit Cloud)."""
+    img = PILImage.open(io.BytesIO(datos))
+    if img.format == "JPEG":
+        img.draft("RGB", (lado_max, lado_max))
+    img = ImageOps.exif_transpose(img)
+
+    # Transparencias (PNG con alfa) sobre fondo blanco; resto de modos a RGB.
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        img = img.convert("RGBA")
+        fondo = PILImage.new("RGB", img.size, (255, 255, 255))
+        fondo.paste(img, mask=img.split()[-1])
+        img = fondo
+    elif img.mode != "RGB":
+        img = img.convert("RGB")
+
+    width, height = img.size
     if height > width:
-        pil_img = pil_img.rotate(-90, expand=True)
+        img = img.rotate(-90, expand=True)
 
+    if max(img.size) > lado_max:
+        img.thumbnail((lado_max, lado_max), PILImage.LANCZOS)
+    return img
+
+
+def codificar_imagen(datos: bytes, lado_max: int, calidad: int) -> bytes:
+    """Devuelve la imagen normalizada como JPEG con el tamaño/calidad dados."""
+    img = _abrir_normalizada(datos, lado_max)
     buffer = io.BytesIO()
-    pil_img.save(buffer, format="JPEG", quality=88)
-    buffer.seek(0)
-    return buffer
+    img.save(buffer, format="JPEG", quality=calidad, optimize=True, progressive=True)
+    img.close()
+    return buffer.getvalue()
 
 
-def insertar_imagenes(ws, archivos_imagenes: list) -> int:
-    """Inserta las imágenes en la hoja. Devuelve cuántas se insertaron
-    correctamente."""
+def comprimir_fotos_para_limite(fotos: list, presupuesto_bytes: int) -> tuple:
+    """Decide la compresión de cada foto para que la suma quepa en
+    'presupuesto_bytes'.
+
+    fotos: lista de (nombre, bytes_originales) en el orden del reporte.
+
+    Estrategia:
+      1. Las N_FOTOS_PRIORITARIAS primeras van en su mejor nivel.
+      2. El resto va en el nivel 0 (sin ahorro). Si el total no cabe,
+         se baja un nivel a TODAS las secundarias y se vuelve a probar,
+         hasta que quepa.
+      3. Solo si ni con las secundarias al mínimo cabe, se bajan también
+         las prioritarias, nivel a nivel.
+
+    Devuelve (lista_jpeg_bytes, info) con info = {'nivel_prioritarias',
+    'nivel_secundarias', 'total_bytes', 'cabe'}. Las fotos que fallen al
+    procesarse quedan como None.
+    """
+    n = len(fotos)
+    idx_prio = list(range(min(N_FOTOS_PRIORITARIAS, n)))
+    idx_sec = list(range(len(idx_prio), n))
+    resultado = [None] * n
+
+    def _codificar(indices, nivel_tabla, nivel):
+        lado, calidad = nivel_tabla[nivel]
+        for i in indices:
+            nombre, datos = fotos[i]
+            try:
+                resultado[i] = codificar_imagen(datos, lado, calidad)
+            except Exception as e:
+                logger.error(f"No se pudo procesar la imagen '{nombre}': {e}")
+                resultado[i] = None
+
+    def _total(indices):
+        return sum(len(resultado[i]) for i in indices if resultado[i])
+
+    nivel_p = 0
+    nivel_s = 0
+    _codificar(idx_prio, NIVELES_PRIORITARIAS, nivel_p)
+    _codificar(idx_sec, NIVELES_SECUNDARIAS, nivel_s)
+
+    while _total(range(n)) > presupuesto_bytes:
+        if idx_sec and nivel_s < len(NIVELES_SECUNDARIAS) - 1:
+            # Salto inteligente: estima cuánto hay que reducir para no
+            # recodificar nivel por nivel cuando el exceso es grande.
+            total_sec = _total(idx_sec)
+            disponible_sec = presupuesto_bytes - _total(idx_prio)
+            nivel_s += 1
+            if disponible_sec > 0 and total_sec > 2.5 * disponible_sec:
+                nivel_s = min(nivel_s + 1, len(NIVELES_SECUNDARIAS) - 1)
+            _codificar(idx_sec, NIVELES_SECUNDARIAS, nivel_s)
+        elif idx_prio and nivel_p < len(NIVELES_PRIORITARIAS) - 1:
+            nivel_p += 1
+            _codificar(idx_prio, NIVELES_PRIORITARIAS, nivel_p)
+        else:
+            break  # ya está todo al mínimo
+
+    total = _total(range(n))
+    info = {
+        "nivel_prioritarias": nivel_p,
+        "nivel_secundarias": nivel_s if idx_sec else None,
+        "total_bytes": total,
+        "cabe": total <= presupuesto_bytes,
+    }
+    logger.info(
+        f"Fotos: {n} | nivel prioritarias={nivel_p} | nivel secundarias={info['nivel_secundarias']} "
+        f"| total imágenes={total / MB:.2f} MB (presupuesto {presupuesto_bytes / MB:.2f} MB)"
+    )
+    return resultado, info
+
+
+def insertar_imagenes(ws, imagenes_jpeg: list, nombres: list) -> int:
+    """Inserta las imágenes (ya comprimidas) en la hoja. Devuelve cuántas
+    se insertaron correctamente.
+
+    openpyxl necesita reabrir la imagen desde un buffer al guardar, por eso
+    a cada XLImage se le entrega su propio BytesIO."""
     insertadas = 0
-    for i, archivo in enumerate(archivos_imagenes):
+    for i, jpeg in enumerate(imagenes_jpeg):
+        if not jpeg:
+            continue
         celda = calcular_celda_imagen(i)
         try:
-            buffer = preparar_imagen(archivo)
-            img = XLImage(buffer)
+            img = XLImage(io.BytesIO(jpeg))
             img.width = TARGET_WIDTH
             img.height = TARGET_HEIGHT
             ws.add_image(img, celda)
             insertadas += 1
         except Exception as e:
-            logger.error(f"Error al procesar/insertar la imagen '{archivo.name}': {e}")
+            logger.error(f"Error al insertar la imagen '{nombres[i]}': {e}")
     return insertadas
 
 
 # --------------------------------------------------------------------------
 # Generación del reporte
 # --------------------------------------------------------------------------
+def _armar_excel(plantilla_bytes: bytes, valores: dict, imagenes_jpeg: list, nombres: list) -> tuple:
+    wb = openpyxl.load_workbook(io.BytesIO(plantilla_bytes))
+    ws = wb.active
+    for campo, celda in CELDAS_EXCEL.items():
+        ws[celda] = valores.get(campo, "")
+    n_insertadas = insertar_imagenes(ws, imagenes_jpeg, nombres)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue(), n_insertadas
+
+
+def _peso_base_excel(plantilla_bytes: bytes, valores: dict) -> int:
+    """Peso del reporte SIN fotos (plantilla + datos)."""
+    excel, _ = _armar_excel(plantilla_bytes, valores, [], [])
+    return len(excel)
+
+
 def generar_reporte(clasificacion: dict) -> tuple:
     """Ejecuta todo el flujo y devuelve (bytes_excel, valores, faltantes,
-    n_imagenes_insertadas). Ningún archivo es obligatorio: si falta la
-    Orden de Trabajo, el de Garantías, fotos o incluso la plantilla
-    (se usa la predeterminada del repositorio en ese caso), el reporte
-    se genera igual dejando en blanco lo que no se pudo obtener."""
+    n_imagenes_insertadas, info_peso). Ningún archivo es obligatorio: si
+    falta la Orden de Trabajo, el de Garantías, fotos o incluso la plantilla
+    (se usa la predeterminada del repositorio en ese caso), el reporte se
+    genera igual dejando en blanco lo que no se pudo obtener.
+
+    El reporte resultante nunca supera LIMITE_REPORTE_BYTES (25 MB)."""
     datos_ot = extraer_datos_pdf(clasificacion["pdf_orden"] or "")
     datos_garantias = extraer_datos_from_garantias_pdf(clasificacion["pdf_garantias"] or "")
 
@@ -495,23 +649,40 @@ def generar_reporte(clasificacion: dict) -> tuple:
             f"'{TEMPLATE_FILENAME}' al repositorio."
         )
 
-    wb = openpyxl.load_workbook(io.BytesIO(plantilla_bytes))
-    ws = wb.active
+    fotos = [(a.name, a.getvalue()) for a in clasificacion["imagenes"]]
+    nombres = [n for n, _ in fotos]
 
-    for campo, celda in CELDAS_EXCEL.items():
-        ws[celda] = valores.get(campo, "")
+    # Presupuesto para fotos = objetivo - peso de la plantilla con datos
+    # - un pequeño margen por la estructura XML/relaciones de cada imagen.
+    peso_base = _peso_base_excel(plantilla_bytes, valores)
+    overhead_fotos = 4 * 1024 * len(fotos)
+    presupuesto = max(OBJETIVO_REPORTE_BYTES - peso_base - overhead_fotos, 1 * MB)
 
-    n_insertadas = insertar_imagenes(ws, clasificacion["imagenes"])
+    imagenes_jpeg, info = comprimir_fotos_para_limite(fotos, presupuesto)
+    excel_bytes, n_insertadas = _armar_excel(plantilla_bytes, valores, imagenes_jpeg, nombres)
 
-    buffer = io.BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
+    # Verificación final con el tamaño REAL del archivo. Si por algún motivo
+    # se pasó, se reduce el presupuesto y se vuelve a comprimir.
+    intentos = 0
+    while len(excel_bytes) > LIMITE_REPORTE_BYTES and intentos < 3 and fotos:
+        exceso = len(excel_bytes) - OBJETIVO_REPORTE_BYTES
+        presupuesto = max(presupuesto - exceso - 512 * 1024, 1 * MB)
+        imagenes_jpeg, info = comprimir_fotos_para_limite(fotos, presupuesto)
+        excel_bytes, n_insertadas = _armar_excel(plantilla_bytes, valores, imagenes_jpeg, nombres)
+        intentos += 1
 
-    return buffer.getvalue(), valores, faltantes, n_insertadas
+    info.update({
+        "peso_final_bytes": len(excel_bytes),
+        "peso_original_fotos_bytes": sum(len(d) for _, d in fotos),
+        "bajo_limite": len(excel_bytes) <= LIMITE_REPORTE_BYTES,
+        "n_fotos": len(fotos),
+    })
+    return excel_bytes, valores, faltantes, n_insertadas, info
 
 
 # --------------------------------------------------------------------------
-# Interfaz Streamlit — tema automotriz
+# Interfaz Streamlit — colores institucionales Astara
+#   Azul marino  #002060   ·   Amarillo  #FFC000
 # --------------------------------------------------------------------------
 st.set_page_config(
     page_title="Reporte Técnico Astara",
@@ -523,57 +694,124 @@ st.set_page_config(
 CUSTOM_CSS = """
 <style>
 :root {
-    --astara-red: #E10600;
-    --astara-dark: #10131A;
+    --astara-navy: #002060;
+    --astara-navy-dark: #001640;
+    --astara-navy-soft: #E8EDF7;
+    --astara-gold: #FFC000;
+    --astara-gold-dark: #D9A300;
+    --astara-text: #0F1B33;
 }
+
+/* Fondo general claro, con una franja azul institucional arriba */
 .stApp {
-    background: radial-gradient(circle at top left, #171B24 0%, #0B0D12 60%);
+    background:
+        linear-gradient(180deg, var(--astara-navy) 0px, var(--astara-navy) 230px, #F3F5FA 230px, #F3F5FA 100%);
+    color: var(--astara-text);
 }
 [data-testid="stHeader"] { background: transparent; }
+.stApp p, .stApp li, .stApp label, .stApp span, .stApp h1, .stApp h2,
+.stApp h3, .stApp h4, .stApp h5, [data-testid="stMarkdownContainer"] {
+    color: var(--astara-text);
+}
+
+/* Barra lateral azul marino con texto claro y acentos amarillos */
+[data-testid="stSidebar"] {
+    background: var(--astara-navy);
+    border-right: 4px solid var(--astara-gold);
+}
+[data-testid="stSidebar"] * { color: #FFFFFF !important; }
+[data-testid="stSidebar"] h3 { color: var(--astara-gold) !important; }
+[data-testid="stSidebar"] code {
+    background: rgba(255, 192, 0, 0.15) !important;
+    color: var(--astara-gold) !important;
+}
+[data-testid="stSidebar"] hr { border-color: rgba(255, 192, 0, 0.4); }
+
+/* Encabezado: barra amarilla con texto azul (igual que los reportes) */
 .astara-hero {
-    background: linear-gradient(120deg, #E10600 0%, #8C0400 100%);
-    padding: 1.6rem 2rem;
-    border-radius: 14px;
+    background: var(--astara-gold);
+    padding: 1.4rem 2rem;
+    border-radius: 12px;
     margin-bottom: 1.4rem;
-    box-shadow: 0 8px 24px rgba(225, 6, 0, 0.25);
+    border-bottom: 6px solid var(--astara-gold-dark);
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.25);
 }
 .astara-hero h1 {
-    color: white;
+    color: var(--astara-navy) !important;
     font-size: 2rem;
+    font-weight: 800;
     margin: 0;
-    letter-spacing: 0.5px;
+    letter-spacing: 0.3px;
 }
 .astara-hero p {
-    color: #FFE3E1;
-    margin: 0.3rem 0 0 0;
-    font-size: 0.95rem;
+    color: var(--astara-navy) !important;
+    margin: 0.35rem 0 0 0;
+    font-size: 0.97rem;
+    opacity: 0.9;
 }
-.astara-card {
-    background: #171B24;
-    border: 1px solid #2A2F3A;
-    border-radius: 12px;
-    padding: 1.2rem 1.4rem;
-    margin-bottom: 1rem;
-}
+
+/* Etiquetas de archivos detectados */
 .astara-badge {
     display: inline-block;
-    background: #232833;
-    color: #E10600;
-    border: 1px solid #E10600;
+    background: #FFFFFF;
+    color: var(--astara-navy) !important;
+    border: 1.5px solid var(--astara-navy);
     border-radius: 999px;
-    padding: 2px 12px;
-    font-size: 0.78rem;
+    padding: 3px 12px;
+    font-size: 0.8rem;
     font-weight: 600;
     margin-right: 6px;
     margin-bottom: 6px;
 }
-.astara-badge.ok { color: #34D399; border-color: #34D399; }
-.astara-badge.warn { color: #FBBF24; border-color: #FBBF24; }
-.astara-badge.missing { color: #9CA3AF; border-color: #4B5563; }
-div[data-testid="stFileUploaderDropzone"] {
-    border: 1.5px dashed #E10600 !important;
-    background: #14171F !important;
+.astara-badge.ok { background: var(--astara-navy); color: #FFFFFF !important; }
+.astara-badge.warn { background: #FFF4D1; border-color: var(--astara-gold-dark); color: #7A5600 !important; }
+.astara-badge.missing { background: #F1F1F1; border-color: #9CA3AF; color: #6B7280 !important; }
+
+/* Títulos de sección con acento amarillo */
+.stApp h4 {
+    color: var(--astara-navy) !important;
+    border-left: 5px solid var(--astara-gold);
+    padding-left: 0.6rem;
 }
+
+/* Zona de carga */
+div[data-testid="stFileUploaderDropzone"] {
+    border: 2px dashed var(--astara-navy) !important;
+    background: #FFFFFF !important;
+}
+div[data-testid="stFileUploaderDropzone"] * { color: var(--astara-navy) !important; }
+
+/* Botones primarios: amarillo con texto azul */
+.stButton > button[kind="primary"],
+.stDownloadButton > button[kind="primary"],
+button[data-testid="stBaseButton-primary"] {
+    background: var(--astara-gold) !important;
+    color: var(--astara-navy) !important;
+    border: 2px solid var(--astara-gold-dark) !important;
+    font-weight: 700 !important;
+}
+.stButton > button[kind="primary"] *,
+.stDownloadButton > button[kind="primary"] *,
+button[data-testid="stBaseButton-primary"] * { color: var(--astara-navy) !important; }
+.stButton > button[kind="primary"]:hover,
+.stDownloadButton > button[kind="primary"]:hover,
+button[data-testid="stBaseButton-primary"]:hover {
+    background: var(--astara-navy) !important;
+    border-color: var(--astara-navy) !important;
+}
+.stButton > button[kind="primary"]:hover *,
+.stDownloadButton > button[kind="primary"]:hover *,
+button[data-testid="stBaseButton-primary"]:hover * { color: var(--astara-gold) !important; }
+
+/* Indicadores de peso */
+[data-testid="stMetric"] {
+    background: #FFFFFF;
+    border: 1px solid #D6DCEA;
+    border-top: 4px solid var(--astara-navy);
+    border-radius: 10px;
+    padding: 0.7rem 1rem;
+}
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color: var(--astara-navy) !important; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -607,6 +845,16 @@ with st.sidebar:
         4. Genera el reporte: lo que no se haya adjuntado queda en blanco
            para completar a mano.
         5. Revisa la vista previa y descarga el reporte final.
+        """
+    )
+    st.divider()
+    st.markdown("### 📦 Peso del reporte")
+    st.markdown(
+        f"""
+        El reporte **nunca supera {LIMITE_REPORTE_BYTES // MB} MB**.
+        - Las **{N_FOTOS_PRIORITARIAS} primeras fotos** se guardan siempre en alta calidad
+          (súbelas primero si son las más importantes).
+        - Las demás solo se comprimen si es necesario para no pasar el límite.
         """
     )
     st.divider()
@@ -651,9 +899,13 @@ if clasificacion["sin_clasificar"]:
 generar = st.button("⚙️ Generar Reporte Técnico Astara", type="primary", use_container_width=True)
 
 if generar:
-    with st.spinner("Extrayendo datos y armando el reporte..."):
+    n_fotos = len(clasificacion["imagenes"])
+    mensaje_spinner = "Extrayendo datos y armando el reporte..."
+    if n_fotos > 10:
+        mensaje_spinner = f"Extrayendo datos y optimizando {n_fotos} fotos para no superar {LIMITE_REPORTE_BYTES // MB} MB..."
+    with st.spinner(mensaje_spinner):
         try:
-            excel_bytes, valores, faltantes, n_insertadas = generar_reporte(clasificacion)
+            excel_bytes, valores, faltantes, n_insertadas, info_peso = generar_reporte(clasificacion)
         except Exception as e:
             st.error(f"No se pudo generar el reporte: {e}")
             logger.error(f"Error generando el reporte: {e}")
@@ -665,6 +917,30 @@ if generar:
             st.warning(f"⚠ Algunos campos críticos quedaron vacíos (por falta de archivos o de datos legibles) y conviene revisarlos a mano: {etiquetas_faltantes}")
         else:
             st.success("Todos los campos críticos se completaron correctamente.")
+
+        # ---- Peso del reporte ----
+        st.markdown("#### 📦 Peso del reporte")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Peso final del Excel", f"{info_peso['peso_final_bytes'] / MB:.2f} MB",
+                  help=f"Límite: {LIMITE_REPORTE_BYTES // MB} MB")
+        c2.metric("Peso original de las fotos", f"{info_peso['peso_original_fotos_bytes'] / MB:.2f} MB")
+        if info_peso["n_fotos"] == 0:
+            estado = "Sin fotos"
+        elif info_peso["nivel_prioritarias"] == 0 and not info_peso["nivel_secundarias"]:
+            estado = "Sin compresión extra"
+        elif info_peso["nivel_prioritarias"] == 0:
+            estado = f"Fotos 3+ comprimidas (nivel {info_peso['nivel_secundarias']})"
+        else:
+            estado = "Todas comprimidas"
+        c3.metric("Optimización aplicada", estado)
+
+        if not info_peso["bajo_limite"]:
+            st.error(
+                f"⚠ Aun con la compresión máxima el reporte pesa {info_peso['peso_final_bytes'] / MB:.2f} MB "
+                f"(> {LIMITE_REPORTE_BYTES // MB} MB). Revisa si la plantilla adjunta es muy pesada o reduce la cantidad de fotos."
+            )
+        elif info_peso["nivel_prioritarias"] > 0:
+            st.info("Por la gran cantidad de fotos también se redujeron levemente las 2 primeras para respetar el límite.")
 
         st.markdown("#### 👀 Vista previa de los datos importados al Excel")
         df_preview = pd.DataFrame(
@@ -683,8 +959,10 @@ if generar:
             st.markdown(f"#### 🖼️ Fotos insertadas en el reporte ({n_insertadas}/{len(clasificacion['imagenes'])})")
             columnas = st.columns(4)
             for i, archivo in enumerate(clasificacion["imagenes"]):
+                etiqueta = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
                 with columnas[i % 4]:
-                    st.image(archivo.getvalue(), caption=f"{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
+                    st.image(archivo.getvalue(), caption=f"{etiqueta}{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
+            st.caption(f"⭐ = foto prioritaria (se conserva en alta calidad).")
         else:
             st.info("No se adjuntaron fotos; el reporte queda sin imágenes insertadas.")
 
