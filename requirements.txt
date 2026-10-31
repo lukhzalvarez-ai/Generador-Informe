@@ -3,3 +3,4 @@ openpyxl>=3.1
 pillow>=10.0
 pypdf>=4.0
 pandas>=2.0
+streamlit-cropper
