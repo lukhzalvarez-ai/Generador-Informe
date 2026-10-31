@@ -53,6 +53,14 @@ try:
 except ImportError:
     HEIF_DISPONIBLE = False
 
+# Recorte interactivo (arrastrar el recuadro). Requiere 'streamlit-cropper' en
+# requirements.txt; si no está, la app ofrece recorte con deslizadores.
+try:
+    from streamlit_cropper import st_cropper
+    CROPPER_DISPONIBLE = True
+except Exception:
+    CROPPER_DISPONIBLE = False
+
 try:
     import pypdf
     PDF_LIBRARY_AVAILABLE = True
@@ -489,17 +497,23 @@ def calcular_celda_imagen(indice: int) -> str:
     return f"{columna}{fila}"
 
 
-def _abrir_normalizada(datos: bytes, lado_max: int) -> PILImage.Image:
+def _abrir_normalizada(datos: bytes, lado_max: int, edicion: dict = None) -> PILImage.Image:
     """Abre la imagen y aplica la misma transformación que el script
     original (orientación EXIF, conversión a RGB, rotación si es vertical),
-    reduciéndola a 'lado_max' px en su lado más largo si es más grande.
+    luego las ediciones del usuario (rotación y recorte, ver aplicar_edicion)
+    y la reduce a 'lado_max' px en su lado más largo si es más grande.
 
     Se usa draft() para que, en JPEG, el decodificador lea directamente a
     una escala menor cuando se va a reducir: ahorra mucha RAM y tiempo con
     fotos de celular de 12-50 MP (importante en Streamlit Cloud)."""
     img = PILImage.open(io.BytesIO(datos))
     if img.format == "JPEG":
-        img.draft("RGB", (lado_max, lado_max))
+        lado_decod = lado_max
+        recorte = (edicion or {}).get("crop")
+        if recorte:  # si se recorta, se decodifica más grande para no perder nitidez
+            fraccion = max(min(recorte[2] - recorte[0], recorte[3] - recorte[1]), 0.05)
+            lado_decod = int(lado_max / fraccion)
+        img.draft("RGB", (lado_decod, lado_decod))
     img = ImageOps.exif_transpose(img)
 
     # Transparencias (PNG con alfa) sobre fondo blanco; resto de modos a RGB.
@@ -515,14 +529,37 @@ def _abrir_normalizada(datos: bytes, lado_max: int) -> PILImage.Image:
     if height > width:
         img = img.rotate(-90, expand=True)
 
+    img = aplicar_edicion(img, edicion)
+
     if max(img.size) > lado_max:
         img.thumbnail((lado_max, lado_max), PILImage.LANCZOS)
     return img
 
 
-def codificar_imagen(datos: bytes, lado_max: int, calidad: int) -> bytes:
-    """Devuelve la imagen normalizada como JPEG con el tamaño/calidad dados."""
-    img = _abrir_normalizada(datos, lado_max)
+def aplicar_edicion(img: PILImage.Image, edicion: dict) -> PILImage.Image:
+    """Aplica la edición del usuario sobre la imagen ya normalizada:
+      - 'rot': grados en sentido horario (0, 90, 180, 270)
+      - 'crop': (izq, arriba, der, abajo) como FRACCIONES 0-1 de la imagen
+        ya rotada, así sirve igual para la miniatura y para la foto completa.
+    """
+    if not edicion:
+        return img
+    rot = edicion.get("rot", 0) % 360
+    if rot:
+        img = img.rotate(-rot, expand=True)
+    recorte = edicion.get("crop")
+    if recorte:
+        w, h = img.size
+        izq, arr, der, aba = (max(0.0, min(1.0, float(v))) for v in recorte)
+        caja = (int(izq * w), int(arr * h), int(der * w), int(aba * h))
+        if caja[2] - caja[0] >= 10 and caja[3] - caja[1] >= 10:
+            img = img.crop(caja)
+    return img
+
+
+def codificar_imagen(datos: bytes, lado_max: int, calidad: int, edicion: dict = None) -> bytes:
+    """Devuelve la imagen normalizada (y editada) como JPEG con el tamaño/calidad dados."""
+    img = _abrir_normalizada(datos, lado_max, edicion)
     buffer = io.BytesIO()
     img.save(buffer, format="JPEG", quality=calidad, optimize=True, progressive=True)
     img.close()
@@ -533,7 +570,7 @@ def comprimir_fotos_para_limite(fotos: list, presupuesto_bytes: int) -> tuple:
     """Decide la compresión de cada foto para que la suma quepa en
     'presupuesto_bytes'.
 
-    fotos: lista de (nombre, bytes_originales) en el orden del reporte.
+    fotos: lista de (nombre, bytes_originales, edicion) en el orden del reporte.
 
     Estrategia:
       1. Las N_FOTOS_PRIORITARIAS primeras van en su mejor nivel.
@@ -555,9 +592,9 @@ def comprimir_fotos_para_limite(fotos: list, presupuesto_bytes: int) -> tuple:
     def _codificar(indices, nivel_tabla, nivel):
         lado, calidad = nivel_tabla[nivel]
         for i in indices:
-            nombre, datos = fotos[i]
+            nombre, datos, edicion = fotos[i]
             try:
-                resultado[i] = codificar_imagen(datos, lado, calidad)
+                resultado[i] = codificar_imagen(datos, lado, calidad, edicion)
             except Exception as e:
                 logger.error(f"No se pudo procesar la imagen '{nombre}': {e}")
                 resultado[i] = None
@@ -722,8 +759,15 @@ def extraer_valores(clasificacion: dict) -> dict:
     return valores
 
 
-def generar_reporte(valores: dict, imagenes: list) -> tuple:
-    """Arma el Excel con los valores YA REVISADOS por el usuario y las fotos.
+def clave_foto(archivo) -> str:
+    """Identificador de una foto subida (nombre + tamaño), para guardar sus
+    ediciones aunque Streamlit vuelva a ejecutar la página."""
+    return f"{archivo.name}|{len(archivo.getvalue())}"
+
+
+def generar_reporte(valores: dict, imagenes: list, ediciones: dict = None) -> tuple:
+    """Arma el Excel con los valores YA REVISADOS por el usuario y las fotos
+    (con sus ediciones de rotación/recorte, si las hay).
     Devuelve (bytes_excel, faltantes, n_imagenes_insertadas, info_peso).
 
     El reporte resultante nunca supera LIMITE_REPORTE_BYTES (25 MB)."""
@@ -736,8 +780,9 @@ def generar_reporte(valores: dict, imagenes: list) -> tuple:
             f"Agrega el archivo '{TEMPLATE_FILENAME}' al repositorio."
         )
 
-    fotos = [(a.name, a.getvalue()) for a in imagenes]
-    nombres = [n for n, _ in fotos]
+    ediciones = ediciones or {}
+    fotos = [(a.name, a.getvalue(), ediciones.get(clave_foto(a))) for a in imagenes]
+    nombres = [f[0] for f in fotos]
 
     # Presupuesto para fotos = objetivo - peso de la plantilla con datos
     # - un pequeño margen por la estructura XML/relaciones de cada imagen.
@@ -760,7 +805,7 @@ def generar_reporte(valores: dict, imagenes: list) -> tuple:
 
     info.update({
         "peso_final_bytes": len(excel_bytes),
-        "peso_original_fotos_bytes": sum(len(d) for _, d in fotos),
+        "peso_original_fotos_bytes": sum(len(f[1]) for f in fotos),
         "bajo_limite": len(excel_bytes) <= LIMITE_REPORTE_BYTES,
         "n_fotos": len(fotos),
     })
@@ -957,7 +1002,9 @@ with st.sidebar:
         4. Revisa el formulario: viene pre-llenado con lo leído de los PDF.
            Completa la **queja**, el **diagnóstico** y el **trabajo
            realizado** sin límite de caracteres.
-        5. Genera el informe y descárgalo listo.
+        5. Si alguna foto quedó chueca o con sobrante, rótala (↺ ↻) o
+           recórtala (✂️) en la sección de fotos.
+        6. Genera el informe y descárgalo listo.
         """
     )
     st.caption("Formatos de foto aceptados: " + ", ".join(sorted(EXTENSIONES_IMAGEN)).upper())
@@ -1013,6 +1060,143 @@ if clasificacion["ignorados"]:
             "y las fotos. Si un PDF que necesitas aparece aquí, cámbiale el nombre y vuelve a subirlo."
         )
         st.markdown("\n".join(f"- {n}" for n in clasificacion["ignorados"]))
+
+# --------------------------------------------------------------------------
+# Fotos: vista previa, rotar y recortar antes de generar
+# --------------------------------------------------------------------------
+if "ediciones" not in st.session_state:
+    st.session_state["ediciones"] = {}   # clave_foto -> {"rot": int, "crop": tuple|None}
+EDICIONES = st.session_state["ediciones"]
+PROPORCION_RECUADRO = (TARGET_WIDTH, TARGET_HEIGHT)  # forma del recuadro de la foto en el informe
+
+
+@st.cache_data(show_spinner=False, max_entries=300)
+def _miniatura_jpeg(datos: bytes, rot: int, crop, lado: int) -> bytes:
+    edicion = {"rot": rot, "crop": crop}
+    img = _abrir_normalizada(datos, lado, edicion)
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=80)
+    return buffer.getvalue()
+
+
+def _edicion_de(clave: str) -> dict:
+    return EDICIONES.get(clave, {"rot": 0, "crop": None})
+
+
+def rotar_foto(clave: str, grados: int) -> None:
+    ed = dict(_edicion_de(clave))
+    ed["rot"] = (ed.get("rot", 0) + grados) % 360
+    ed["crop"] = None  # el recorte se definió sobre la orientación anterior
+    EDICIONES[clave] = ed
+
+
+def abrir_recorte(clave: str) -> None:
+    st.session_state["foto_en_recorte"] = clave
+
+
+def cerrar_recorte() -> None:
+    st.session_state.pop("foto_en_recorte", None)
+
+
+def guardar_recorte(clave: str, crop) -> None:
+    ed = dict(_edicion_de(clave))
+    ed["crop"] = crop
+    EDICIONES[clave] = ed
+    cerrar_recorte()
+
+
+def restablecer_foto(clave: str) -> None:
+    EDICIONES.pop(clave, None)
+    cerrar_recorte()
+
+
+if clasificacion["imagenes"]:
+    st.markdown("#### 🖼️ Fotos del informe")
+    st.caption(
+        "Así quedarán en el informe y en este orden. ⭐ = alta calidad. "
+        "Usa ↺ ↻ para rotar y ✂️ para recortar; los cambios se aplican al generar el informe."
+    )
+    columnas = st.columns(4)
+    archivo_en_recorte = None
+    for i, archivo in enumerate(clasificacion["imagenes"]):
+        clave = clave_foto(archivo)
+        ed = _edicion_de(clave)
+        if st.session_state.get("foto_en_recorte") == clave:
+            archivo_en_recorte = archivo
+        marcas = []
+        if ed.get("rot"):
+            marcas.append(f"rotada {ed['rot']}°")
+        if ed.get("crop"):
+            marcas.append("recortada")
+        estrella = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
+        with columnas[i % 4]:
+            try:
+                st.image(_miniatura_jpeg(archivo.getvalue(), ed.get("rot", 0), ed.get("crop"), 480),
+                         use_container_width=True)
+            except Exception:
+                st.warning("No se pudo mostrar esta foto.")
+            st.caption(f"{estrella}{i + 1}. {calcular_celda_imagen(i)} · {archivo.name}"
+                       + (f" · ✏️ {', '.join(marcas)}" if marcas else ""))
+            b1, b2, b3 = st.columns(3)
+            b1.button("↺", key=f"rotizq_{i}", on_click=rotar_foto, args=(clave, -90),
+                      help="Rotar 90° a la izquierda", use_container_width=True)
+            b2.button("↻", key=f"rotder_{i}", on_click=rotar_foto, args=(clave, 90),
+                      help="Rotar 90° a la derecha", use_container_width=True)
+            b3.button("✂️", key=f"recortar_{i}", on_click=abrir_recorte, args=(clave,),
+                      help="Recortar", use_container_width=True)
+
+    # ---- Editor de recorte (una foto a la vez) ----
+    if archivo_en_recorte is not None:
+        clave = clave_foto(archivo_en_recorte)
+        ed = _edicion_de(clave)
+        with st.container(border=True):
+            st.markdown(f"##### ✂️ Recortar: {archivo_en_recorte.name}")
+            libre = st.checkbox(
+                "Proporción libre", value=False, key=f"libre_{clave}",
+                help="Por defecto el recorte usa la forma del recuadro de la foto en el informe, "
+                     "así la foto no se ve estirada ni aplastada.",
+            )
+            # Imagen base: rotada pero SIN recortar, de máx. 600 px para que el
+            # recortador no la reescale (las coordenadas quedan en sus píxeles).
+            base = _abrir_normalizada(archivo_en_recorte.getvalue(), 600, {"rot": ed.get("rot", 0)})
+            w, h = base.size
+            nuevo_crop = None
+            usar_deslizadores = not CROPPER_DISPONIBLE
+            if CROPPER_DISPONIBLE:
+                st.caption("Arrastra y ajusta el recuadro amarillo sobre la zona que quieres conservar.")
+                try:
+                    caja = st_cropper(
+                        base, realtime_update=True, box_color="#FFC000",
+                        aspect_ratio=None if libre else PROPORCION_RECUADRO,
+                        return_type="box", key=f"cropper_{clave}_{libre}",
+                    )
+                    izq, arr = caja["left"] / w, caja["top"] / h
+                    nuevo_crop = (izq, arr, izq + caja["width"] / w, arr + caja["height"] / h)
+                except Exception as e:  # si el componente falla, se usa el plan B
+                    logger.error(f"Recortador interactivo no disponible: {e}")
+                    usar_deslizadores = True
+            if usar_deslizadores:
+                st.caption("Ajusta cuánto recortar de cada borde (en %).")
+                c1, c2 = st.columns(2)
+                m_izq = c1.slider("Recortar a la izquierda", 0, 90, 0, key=f"mi_{clave}")
+                m_der = c1.slider("Recortar a la derecha", 0, 90, 0, key=f"md_{clave}")
+                m_arr = c2.slider("Recortar arriba", 0, 90, 0, key=f"ma_{clave}")
+                m_aba = c2.slider("Recortar abajo", 0, 90, 0, key=f"mb_{clave}")
+                if m_izq + m_der < 95 and m_arr + m_aba < 95:
+                    nuevo_crop = (m_izq / 100, m_arr / 100, 1 - m_der / 100, 1 - m_aba / 100)
+                else:
+                    st.warning("El recorte deja la foto vacía; reduce los márgenes.")
+
+            if nuevo_crop:
+                st.caption("Vista previa del resultado:")
+                st.image(aplicar_edicion(base, {"crop": nuevo_crop}), width=360)
+
+            a1, a2, a3 = st.columns(3)
+            a1.button("✅ Aplicar recorte", type="primary", use_container_width=True,
+                      on_click=guardar_recorte, args=(clave, nuevo_crop), disabled=nuevo_crop is None)
+            a2.button("↩️ Deshacer cambios de esta foto", use_container_width=True,
+                      on_click=restablecer_foto, args=(clave,))
+            a3.button("Cerrar", use_container_width=True, on_click=cerrar_recorte)
 
 # --------------------------------------------------------------------------
 # Paso 2: revisar / completar los textos antes de generar
@@ -1083,7 +1267,7 @@ if generar:
         mensaje_spinner = f"Armando el reporte y optimizando {n_fotos} fotos para no superar {LIMITE_REPORTE_BYTES // MB} MB..."
     with st.spinner(mensaje_spinner):
         try:
-            excel_bytes, _, n_insertadas, info_peso = generar_reporte(valores, clasificacion["imagenes"])
+            excel_bytes, _, n_insertadas, info_peso = generar_reporte(valores, clasificacion["imagenes"], EDICIONES)
         except Exception as e:
             st.error(f"No se pudo generar el reporte: {e}")
             logger.error(f"Error generando el reporte: {e}")
@@ -1134,18 +1318,9 @@ if generar:
         st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
         if clasificacion["imagenes"]:
-            st.markdown(f"#### 🖼️ Fotos insertadas en el reporte ({n_insertadas}/{len(clasificacion['imagenes'])})")
-            columnas = st.columns(4)
-            for i, archivo in enumerate(clasificacion["imagenes"]):
-                etiqueta = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
-                with columnas[i % 4]:
-                    try:
-                        # Miniatura liviana (también sirve para HEIC, que el navegador no muestra)
-                        miniatura = _abrir_normalizada(archivo.getvalue(), 600)
-                        st.image(miniatura, caption=f"{etiqueta}{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
-                    except Exception:
-                        st.caption(f"{etiqueta}{calcular_celda_imagen(i)} · {archivo.name}")
-            st.caption(f"⭐ = foto prioritaria (se conserva en alta calidad).")
+            n_editadas = sum(1 for a in clasificacion["imagenes"] if EDICIONES.get(clave_foto(a)))
+            st.caption(f"🖼️ Fotos insertadas: {n_insertadas}/{len(clasificacion['imagenes'])}"
+                       + (f" · {n_editadas} con rotación/recorte aplicado" if n_editadas else ""))
         else:
             st.info("No se adjuntaron fotos; el reporte queda sin imágenes insertadas.")
 
