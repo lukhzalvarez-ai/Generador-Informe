@@ -641,11 +641,54 @@ def _escribir_celda(ws, coordenada: str, valor) -> None:
     celda.value = valor
 
 
+def _ancho_columna(ws, letra: str) -> float:
+    dim = ws.column_dimensions.get(letra)
+    return dim.width if dim is not None and dim.width else 8.43
+
+
+def _ajustar_alto_celda_texto(ws, coordenada: str, texto: str) -> None:
+    """Si el texto no cabe en el recuadro combinado (ej. C16:I18), agranda
+    el alto de sus filas para que se lea completo en el Excel. Las fotos
+    están ancladas a celdas, así que se desplazan solas hacia abajo."""
+    if not texto:
+        return
+    rango = next((r for r in ws.merged_cells.ranges if coordenada in r), None)
+    if rango is None:
+        return
+    ancho_chars = sum(
+        _ancho_columna(ws, openpyxl.utils.get_column_letter(c))
+        for c in range(rango.min_col, rango.max_col + 1)
+    ) * 1.05  # ~caracteres por línea con fuente de 10-11 pt
+    lineas = 0
+    for parrafo in str(texto).split("\n"):
+        lineas += max(1, -(-len(parrafo) // max(int(ancho_chars), 1)))  # división hacia arriba
+    alto_necesario = lineas * 15.0 + 4
+    filas = list(range(rango.min_row, rango.max_row + 1))
+    alto_actual = sum((ws.row_dimensions[f].height or 15.0) for f in filas)
+    if alto_necesario <= alto_actual:
+        return
+    alto_por_fila = min(alto_necesario / len(filas), 409)  # 409 = máximo de Excel
+    for f in filas:
+        ws.row_dimensions[f].height = alto_por_fila
+
+    celda = ws.cell(row=rango.min_row, column=rango.min_col)
+    al = celda.alignment
+    celda.alignment = openpyxl.styles.Alignment(
+        horizontal=al.horizontal, vertical=al.vertical or "top", wrap_text=True,
+        indent=al.indent, text_rotation=al.text_rotation, shrink_to_fit=False,
+    )
+
+
+CAMPOS_TEXTO_LARGO = ("queja_cliente", "diagnostico_tecnico", "repuestos_usados", "trabajo_realizado")
+
+
 def _armar_excel(plantilla_bytes: bytes, valores: dict, imagenes_jpeg: list, nombres: list) -> tuple:
     wb = openpyxl.load_workbook(io.BytesIO(plantilla_bytes))
     ws = wb.active
     for campo, celda in CELDAS_EXCEL.items():
         _escribir_celda(ws, celda, valores.get(campo, ""))
+    for campo in CAMPOS_TEXTO_LARGO:
+        _ajustar_alto_celda_texto(ws, CELDAS_EXCEL[campo], valores.get(campo, ""))
     n_insertadas = insertar_imagenes(ws, imagenes_jpeg, nombres)
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -658,14 +701,28 @@ def _peso_base_excel(plantilla_bytes: bytes, valores: dict) -> int:
     return len(excel)
 
 
-def generar_reporte(clasificacion: dict) -> tuple:
-    """Ejecuta todo el flujo y devuelve (bytes_excel, valores, faltantes,
-    n_imagenes_insertadas, info_peso). Ningún archivo es obligatorio: si
-    falta la Orden de Trabajo, el de Garantías, fotos o incluso la plantilla
-    (se usa la predeterminada del repositorio en ese caso), el reporte se
-    genera igual dejando en blanco lo que no se pudo obtener.
+def detectar_reingreso(texto_ot: str):
+    """Lee el campo 'Trabajo repetido' de la Orden de Trabajo.
+    Devuelve True (Sí), False (No) o None (no se encontró)."""
+    if not texto_ot:
+        return None
+    m = re.search(r"Trabajo\s+repetido\s*\n?\s*(S[íi]|No)\b", texto_ot, re.IGNORECASE)
+    if not m:
+        return None
+    return m.group(1).lower().startswith("s")
 
-    El reporte resultante nunca supera LIMITE_REPORTE_BYTES (25 MB)."""
+
+def componer_queja(queja: str, es_reingreso: bool) -> str:
+    """Texto final de C12: la queja + la respuesta explícita sobre reingreso
+    que pide la pregunta 1 del formulario."""
+    linea = "Reingreso (menos de 6 meses): " + ("SÍ" if es_reingreso else "NO")
+    queja = (queja or "").strip()
+    return f"{queja}\n{linea}" if queja else linea
+
+
+def extraer_valores(clasificacion: dict) -> dict:
+    """Lee los PDF y devuelve los valores sugeridos para cada celda, más la
+    clave especial 'es_reingreso' (True/False/None)."""
     datos_ot = extraer_datos_pdf(clasificacion["pdf_orden"] or "")
     datos_garantias = extraer_datos_from_garantias_pdf(clasificacion["pdf_garantias"] or "")
 
@@ -682,6 +739,15 @@ def generar_reporte(clasificacion: dict) -> tuple:
         "diagnostico_tecnico": datos_garantias.get("diagnostico_tecnico_garantias", ""),
         "repuestos_usados": datos_garantias.get("repuestos_usados_garantias", ""),
     }
+    valores["es_reingreso"] = detectar_reingreso(clasificacion["pdf_orden"] or "")
+    return valores
+
+
+def generar_reporte(valores: dict, imagenes: list) -> tuple:
+    """Arma el Excel con los valores YA REVISADOS por el usuario y las fotos.
+    Devuelve (bytes_excel, faltantes, n_imagenes_insertadas, info_peso).
+
+    El reporte resultante nunca supera LIMITE_REPORTE_BYTES (25 MB)."""
     faltantes = validar_campos_criticos(valores)
 
     plantilla_bytes = cargar_plantilla_predeterminada()
@@ -691,7 +757,7 @@ def generar_reporte(clasificacion: dict) -> tuple:
             f"Agrega el archivo '{TEMPLATE_FILENAME}' al repositorio."
         )
 
-    fotos = [(a.name, a.getvalue()) for a in clasificacion["imagenes"]]
+    fotos = [(a.name, a.getvalue()) for a in imagenes]
     nombres = [n for n, _ in fotos]
 
     # Presupuesto para fotos = objetivo - peso de la plantilla con datos
@@ -719,7 +785,7 @@ def generar_reporte(clasificacion: dict) -> tuple:
         "bajo_limite": len(excel_bytes) <= LIMITE_REPORTE_BYTES,
         "n_fotos": len(fotos),
     })
-    return excel_bytes, valores, faltantes, n_insertadas, info
+    return excel_bytes, faltantes, n_insertadas, info
 
 
 # --------------------------------------------------------------------------
@@ -828,9 +894,24 @@ div[data-testid="stFileUploaderDropzone"] {
 }
 div[data-testid="stFileUploaderDropzone"] * { color: var(--astara-text) !important; }
 
+/* Formulario de revisión */
+[data-testid="stForm"] {
+    background: var(--astara-surface);
+    border: 1px solid var(--astara-border) !important;
+    border-top: 4px solid var(--astara-gold) !important;
+    border-radius: 12px;
+}
+[data-testid="stForm"] textarea, [data-testid="stForm"] input {
+    background: #0B1530 !important;
+    color: var(--astara-text) !important;
+}
+[data-testid="stForm"] label p { font-weight: 600; }
+
 /* Botones primarios: amarillo con texto azul */
 .stButton > button[kind="primary"],
 .stDownloadButton > button[kind="primary"],
+.stFormSubmitButton > button,
+button[data-testid="stBaseButton-primaryFormSubmit"],
 button[data-testid="stBaseButton-primary"] {
     background: var(--astara-gold) !important;
     color: var(--astara-navy) !important;
@@ -839,15 +920,21 @@ button[data-testid="stBaseButton-primary"] {
 }
 .stButton > button[kind="primary"] *,
 .stDownloadButton > button[kind="primary"] *,
+.stFormSubmitButton > button *,
+button[data-testid="stBaseButton-primaryFormSubmit"] *,
 button[data-testid="stBaseButton-primary"] * { color: var(--astara-navy) !important; }
 .stButton > button[kind="primary"]:hover,
 .stDownloadButton > button[kind="primary"]:hover,
+.stFormSubmitButton > button:hover,
+button[data-testid="stBaseButton-primaryFormSubmit"]:hover,
 button[data-testid="stBaseButton-primary"]:hover {
     background: var(--astara-navy) !important;
     border-color: var(--astara-gold) !important;
 }
 .stButton > button[kind="primary"]:hover *,
 .stDownloadButton > button[kind="primary"]:hover *,
+.stFormSubmitButton > button:hover *,
+button[data-testid="stBaseButton-primaryFormSubmit"]:hover *,
 button[data-testid="stBaseButton-primary"]:hover * { color: var(--astara-gold) !important; }
 
 /* Indicadores de peso */
@@ -888,9 +975,10 @@ with st.sidebar:
         2. Los PDF **deben llamarse exactamente así**. Cualquier otro
            PDF, Excel, Word, etc. se ignora automáticamente.
         3. La plantilla del **Reporte Técnico Astara ya viene integrada**.
-        4. Genera el reporte: lo que no se haya adjuntado queda en blanco
-           para completar a mano.
-        5. Revisa la vista previa y descarga el reporte final.
+        4. Revisa el formulario: viene pre-llenado con lo leído de los PDF.
+           Completa la **queja**, el **diagnóstico** y el **trabajo
+           realizado** sin límite de caracteres.
+        5. Genera el informe y descárgalo listo.
         """
     )
     st.caption("Formatos de foto aceptados: " + ", ".join(sorted(EXTENSIONES_IMAGEN)).upper())
@@ -947,16 +1035,88 @@ if clasificacion["ignorados"]:
         )
         st.markdown("\n".join(f"- {n}" for n in clasificacion["ignorados"]))
 
-generar = st.button("⚙️ Generar Reporte Técnico Astara", type="primary", use_container_width=True)
+# --------------------------------------------------------------------------
+# Paso 2: revisar / completar los textos antes de generar
+# --------------------------------------------------------------------------
+valores_pdf = extraer_valores(clasificacion)
+CAMPOS_DATOS_GENERALES = ("vin", "fecha_falla", "fecha_cierre_ot", "km",
+                          "concesionario", "asesor_responsable", "tecnico")
+
+
+def cargar_en_formulario(vals: dict) -> None:
+    """Rellena los campos del formulario con lo leído de los PDF."""
+    for campo in CELDAS_EXCEL:
+        st.session_state[f"campo_{campo}"] = vals.get(campo, "") or ""
+    st.session_state["campo_reingreso"] = "Sí" if vals.get("es_reingreso") else "No"
+
+
+# Solo se recargan los campos cuando cambian los PDF; así lo que el usuario
+# escribió no se pierde al agregar o quitar fotos.
+firma_pdfs = hash((clasificacion["pdf_orden"] or "", clasificacion["pdf_garantias"] or ""))
+if st.session_state.get("firma_pdfs") != firma_pdfs:
+    cargar_en_formulario(valores_pdf)
+    st.session_state["firma_pdfs"] = firma_pdfs
+
+col_tit, col_btn = st.columns([4, 1])
+with col_tit:
+    st.markdown("#### ✍️ Revisa y completa el informe")
+with col_btn:
+    st.button("↺ Volver a lo leído de los PDF", on_click=cargar_en_formulario,
+              args=(valores_pdf,), use_container_width=True)
+st.caption(
+    "Los campos vienen pre-llenados con lo que se pudo leer de los PDF. "
+    "Completa o corrige aquí lo que haga falta (sin límite de caracteres) y luego genera el informe."
+)
+
+with st.form("form_reporte", border=True):
+    st.text_area(
+        "1) ¿Cuál fue la queja del cliente?",
+        key="campo_queja_cliente", height=110,
+        placeholder="Ej.: Cliente ingresa con el motor bloqueado, este no gira.",
+    )
+    if valores_pdf.get("es_reingreso") is None:
+        ayuda_reingreso = "No se encontró el campo 'Trabajo repetido' en la Orden de Trabajo; indícalo manualmente."
+    else:
+        ayuda_reingreso = (
+            "Pre-marcado según el campo 'Trabajo repetido' de la Orden de Trabajo "
+            f"({'Sí' if valores_pdf['es_reingreso'] else 'No'})."
+        )
+    st.radio("¿Es reingreso (menos de 6 meses)?", ["No", "Sí"], key="campo_reingreso",
+             horizontal=True, help=ayuda_reingreso)
+
+    st.text_area(
+        "2) ¿Cuál es el resultado de su investigación? (Diagnóstico técnico)",
+        key="campo_diagnostico_tecnico", height=180,
+        placeholder="Ej.: Se inspecciona visualmente el motor y presenta una biela desprendida por un costado del block...",
+    )
+    st.text_area("3) Repuestos utilizados", key="campo_repuestos_usados", height=140)
+    st.text_area(
+        "4) ¿Cómo se reparó / qué se realizó para solucionar el problema? (Trabajo técnico realizado)",
+        key="campo_trabajo_realizado", height=140,
+        placeholder="Ej.: Se reemplaza ensamble motor y válvula EGR, se realizan pruebas de funcionamiento...",
+    )
+
+    with st.expander("🚗 Datos del vehículo y la OT (VIN, fechas, km, concesionario, asesor, técnico)"):
+        cols = st.columns(3)
+        for i, campo in enumerate(CAMPOS_DATOS_GENERALES):
+            cols[i % 3].text_input(ETIQUETAS_CAMPOS[campo], key=f"campo_{campo}")
+
+    generar = st.form_submit_button("⚙️ Generar Reporte Técnico Astara", type="primary",
+                                    use_container_width=True)
 
 if generar:
+    valores = {campo: (st.session_state.get(f"campo_{campo}", "") or "").strip() for campo in CELDAS_EXCEL}
+    faltantes = validar_campos_criticos(valores)
+    valores["queja_cliente"] = componer_queja(valores["queja_cliente"],
+                                              st.session_state.get("campo_reingreso") == "Sí")
+
     n_fotos = len(clasificacion["imagenes"])
-    mensaje_spinner = "Extrayendo datos y armando el reporte..."
+    mensaje_spinner = "Armando el reporte..."
     if n_fotos > 10:
-        mensaje_spinner = f"Extrayendo datos y optimizando {n_fotos} fotos para no superar {LIMITE_REPORTE_BYTES // MB} MB..."
+        mensaje_spinner = f"Armando el reporte y optimizando {n_fotos} fotos para no superar {LIMITE_REPORTE_BYTES // MB} MB..."
     with st.spinner(mensaje_spinner):
         try:
-            excel_bytes, valores, faltantes, n_insertadas, info_peso = generar_reporte(clasificacion)
+            excel_bytes, _, n_insertadas, info_peso = generar_reporte(valores, clasificacion["imagenes"])
         except Exception as e:
             st.error(f"No se pudo generar el reporte: {e}")
             logger.error(f"Error generando el reporte: {e}")
@@ -965,9 +1125,9 @@ if generar:
     if excel_bytes:
         if faltantes:
             etiquetas_faltantes = ", ".join(ETIQUETAS_CAMPOS.get(c, c) for c in faltantes)
-            st.warning(f"⚠ Algunos campos críticos quedaron vacíos (por falta de archivos o de datos legibles) y conviene revisarlos a mano: {etiquetas_faltantes}")
+            st.warning(f"⚠ Estos campos importantes quedaron vacíos; puedes completarlos arriba y volver a generar: {etiquetas_faltantes}")
         else:
-            st.success("Todos los campos críticos se completaron correctamente.")
+            st.success("✅ Informe generado con todos los campos importantes completos.")
 
         # ---- Peso del reporte ----
         st.markdown("#### 📦 Peso del reporte")
@@ -988,7 +1148,7 @@ if generar:
         if not info_peso["bajo_limite"]:
             st.error(
                 f"⚠ Aun con la compresión máxima el reporte pesa {info_peso['peso_final_bytes'] / MB:.2f} MB "
-                f"(> {LIMITE_REPORTE_BYTES // MB} MB). Revisa si la plantilla adjunta es muy pesada o reduce la cantidad de fotos."
+                f"(> {LIMITE_REPORTE_BYTES // MB} MB). Reduce la cantidad de fotos."
             )
         elif info_peso["nivel_prioritarias"] > 0:
             st.info("Por la gran cantidad de fotos también se redujeron levemente las 2 primeras para respetar el límite.")
