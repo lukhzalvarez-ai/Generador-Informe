@@ -33,7 +33,9 @@ adjunten (hasta ~25 o más):
 
 import io
 import re
+import base64
 import logging
+import tempfile
 import unicodedata
 from pathlib import Path
 
@@ -1161,51 +1163,211 @@ def quitar_recortes_todas(archivos: list) -> None:
             EDICIONES[clave] = {**EDICIONES[clave], "crop": None, "ajuste": None}
 
 
+# ---- Recortador interactivo propio (sin librerías externas) --------------
+# Componente "bidireccional" sin compilación: un index.html que habla con
+# Streamlit por postMessage. El recuadro se mueve en el navegador (fluido) y
+# solo avisa a la app al SOLTAR el mouse; nunca se sale de la foto.
+_HTML_RECORTADOR = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden;
+               user-select: none; -webkit-user-select: none; }
+  #zona { position: relative; margin: 0 auto; overflow: hidden; touch-action: none; }
+  #zona img { display: block; width: 100%; height: 100%; pointer-events: none; }
+  #caja { position: absolute; border: 2px solid #FFC000; box-sizing: border-box; cursor: move;
+          box-shadow: 0 0 0 9999px rgba(0, 0, 0, .55); touch-action: none; }
+  #caja::before, #caja::after { content: ""; position: absolute; border: 0 dashed rgba(255,192,0,.5); }
+  #caja::before { left: 33.3%; right: 33.3%; top: 0; bottom: 0; border-left-width: 1px; border-right-width: 1px; }
+  #caja::after  { top: 33.3%; bottom: 33.3%; left: 0; right: 0; border-top-width: 1px; border-bottom-width: 1px; }
+  .esq { position: absolute; width: 18px; height: 18px; background: #FFC000; border: 2px solid #002060;
+         border-radius: 3px; box-sizing: border-box; touch-action: none; z-index: 2; }
+  .nw { left: -9px; top: -9px; cursor: nwse-resize; }   .ne { right: -9px; top: -9px; cursor: nesw-resize; }
+  .sw { left: -9px; bottom: -9px; cursor: nesw-resize; } .se { right: -9px; bottom: -9px; cursor: nwse-resize; }
+</style></head>
+<body>
+<div id="zona"><img id="img" alt=""><div id="caja">
+  <div class="esq nw" data-c="nw"></div><div class="esq ne" data-c="ne"></div>
+  <div class="esq sw" data-c="sw"></div><div class="esq se" data-c="se"></div>
+</div></div>
+<script>
+  // Recortador propio, sin librerías externas.
+  // Estado en píxeles de pantalla: x, y, w, h del recuadro dentro de la foto (W x H).
+  function enviar(tipo, extra) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: tipo}, extra || {}), "*");
+  }
+  var zona = document.getElementById("zona"), img = document.getElementById("img"),
+      caja = document.getElementById("caja");
+  var W = 0, H = 0, aspecto = null, ultimaClave = null, MIN = 24;
+  var r = {x: 0, y: 0, w: 0, h: 0}, arrastre = null;
+
+  function pintar() {
+    caja.style.left = r.x + "px"; caja.style.top = r.y + "px";
+    caja.style.width = r.w + "px"; caja.style.height = r.h + "px";
+  }
+  function enviarValor() {
+    enviar("streamlit:setComponentValue", {dataType: "json", value: {
+      l: r.x / W, t: r.y / H, r: (r.x + r.w) / W, b: (r.y + r.h) / H}});
+  }
+  function ajustarAspecto() {          // fuerza la forma y lo deja dentro de la foto
+    if (aspecto) {
+      if (r.w / r.h > aspecto) r.w = r.h * aspecto; else r.h = r.w / aspecto;
+    }
+    r.w = Math.min(r.w, W); r.h = Math.min(r.h, H);
+    if (aspecto) { if (r.w / r.h > aspecto) r.w = r.h * aspecto; else r.h = r.w / aspecto; }
+    r.x = Math.min(Math.max(r.x, 0), W - r.w); r.y = Math.min(Math.max(r.y, 0), H - r.h);
+  }
+  function punto(e) {
+    var b = zona.getBoundingClientRect();
+    return {x: e.clientX - b.left, y: e.clientY - b.top};
+  }
+  function iniciar(e) {
+    e.preventDefault(); e.stopPropagation();
+    var esquina = e.target.getAttribute("data-c");
+    var p = punto(e);
+    arrastre = {esquina: esquina, p0: p, r0: {x: r.x, y: r.y, w: r.w, h: r.h}};
+    if (esquina) {                     // la esquina opuesta queda fija
+      arrastre.ax = esquina.indexOf("w") >= 0 ? r.x + r.w : r.x;
+      arrastre.ay = esquina.indexOf("n") >= 0 ? r.y + r.h : r.y;
+      arrastre.izq = esquina.indexOf("w") >= 0; arrastre.arr = esquina.indexOf("n") >= 0;
+    }
+    try { e.target.setPointerCapture(e.pointerId); } catch (err) {}
+  }
+  function mover(e) {
+    if (!arrastre) return;
+    e.preventDefault();
+    var p = punto(e), a = arrastre;
+    if (!a.esquina) {                  // mover el recuadro completo
+      r.x = Math.min(Math.max(a.r0.x + p.x - a.p0.x, 0), W - r.w);
+      r.y = Math.min(Math.max(a.r0.y + p.y - a.p0.y, 0), H - r.h);
+    } else {                           // redimensionar desde una esquina
+      var maxW = a.izq ? a.ax : W - a.ax, maxH = a.arr ? a.ay : H - a.ay;
+      var nw = Math.abs(p.x - a.ax), nh = Math.abs(p.y - a.ay);
+      if (aspecto) {
+        nw = Math.max(nw, nh * aspecto);
+        nw = Math.min(nw, maxW, maxH * aspecto);
+        nw = Math.max(nw, MIN * aspecto); nh = nw / aspecto;
+      } else {
+        nw = Math.max(MIN, Math.min(nw, maxW)); nh = Math.max(MIN, Math.min(nh, maxH));
+      }
+      r.w = nw; r.h = nh;
+      r.x = a.izq ? a.ax - nw : a.ax; r.y = a.arr ? a.ay - nh : a.ay;
+    }
+    pintar();
+  }
+  function soltar() { if (arrastre) { arrastre = null; enviarValor(); } }
+
+  caja.addEventListener("pointerdown", iniciar);
+  window.addEventListener("pointermove", mover);
+  window.addEventListener("pointerup", soltar);
+  window.addEventListener("pointercancel", soltar);
+
+  function render(args) {
+    if (args.clave === ultimaClave) return;   // no reiniciar el recuadro en cada actualización
+    ultimaClave = args.clave;
+    aspecto = args.aspect || null;
+    var disponible = document.body.clientWidth || 700;
+    W = Math.min(disponible, args.alto_max * args.w / args.h);
+    H = W * args.h / args.w;
+    zona.style.width = W + "px"; zona.style.height = H + "px";
+    enviar("streamlit:setFrameHeight", {height: Math.ceil(H) + 4});
+    var c = args.inicial;
+    if (c) {
+      r = {x: c[0] * W, y: c[1] * H, w: (c[2] - c[0]) * W, h: (c[3] - c[1]) * H};
+    } else {                           // por defecto: 90 % del máximo, centrado
+      r = {w: W, h: H, x: 0, y: 0};
+      if (aspecto) { if (W / H > aspecto) r.w = H * aspecto; else r.h = W / aspecto; }
+      r.w *= 0.9; r.h *= 0.9; r.x = (W - r.w) / 2; r.y = (H - r.h) / 2;
+    }
+    ajustarAspecto();
+    img.src = args.src;
+    pintar();
+    enviarValor();
+  }
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") render(e.data.args);
+  });
+  enviar("streamlit:componentReady", {apiVersion: 1});
+</script>
+</body></html>
+"""
+
+
+@st.cache_resource(show_spinner=False)
+def _declarar_recortador():
+    """Escribe el index.html del componente en una carpeta temporal y lo
+    registra en Streamlit (una sola vez por servidor)."""
+    try:
+        import streamlit.components.v1 as components
+        carpeta = Path(tempfile.gettempdir()) / "astara_recortador_v1"
+        carpeta.mkdir(parents=True, exist_ok=True)
+        (carpeta / "index.html").write_text(_HTML_RECORTADOR, encoding="utf-8")
+        return components.declare_component("astara_recortador", path=str(carpeta))
+    except Exception as e:
+        logger.error(f"No se pudo preparar el recortador interactivo: {e}")
+        return None
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def _data_url_editor(datos: bytes, rot: int) -> str:
+    img = _base_editor(datos, rot)
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+
 def _editor_recorte(archivo) -> None:
-    """Editor de recorte de UNA foto (dentro de una ventana emergente). Usa
-    deslizadores sobre una copia liviana en caché, así responde al instante."""
+    """Editor de recorte de UNA foto (en ventana emergente): recuadro que se
+    agranda/achica desde las esquinas y se mueve arrastrándolo, manteniendo
+    la forma del recuadro del informe (salvo que se elija 'Proporción libre')."""
     clave = clave_foto(archivo)
     ed = _edicion_de(clave)
-    ajuste = ed.get("ajuste") or {}
-    base = _base_editor(archivo.getvalue(), ed.get("rot", 0))
+    rot = ed.get("rot", 0)
+    base = _base_editor(archivo.getvalue(), rot)
     w, h = base.size
 
-    modo = st.radio(
-        "Tipo de recorte", ["📐 Forma del informe", "✂️ Libre"], horizontal=True,
-        index=1 if ajuste.get("modo") == "libre" else 0, key=f"modo_{clave}",
-        help="'Forma del informe' recorta con la misma forma del recuadro de la foto en el Excel, "
-             "así no sale estirada. 'Libre' permite recortar cada borde por separado.",
+    libre = st.checkbox(
+        "Proporción libre", value=(ed.get("ajuste") or {}).get("modo") == "libre_arrastre",
+        key=f"libre_{clave}",
+        help="Por defecto el recuadro mantiene la forma de la foto en el informe, "
+             "así no sale estirada. Marca esto para recortar con cualquier forma.",
     )
-    col_ctrl, col_prev = st.columns([1, 2])
-    with col_ctrl:
-        if modo.startswith("📐"):
-            zoom = st.slider("🔍 Acercar", 100, 300, int(round(ajuste.get("zoom", 1.0) * 100)),
-                             step=5, format="%d%%", key=f"zoom_{clave}")
-            px = st.slider("↔️ Mover (izquierda – derecha)", 0, 100,
-                           int(round(ajuste.get("px", 0.5) * 100)), key=f"px_{clave}")
-            py = st.slider("↕️ Mover (arriba – abajo)", 0, 100,
-                           int(round(ajuste.get("py", 0.5) * 100)), key=f"py_{clave}")
+    st.caption("Arrastra las **esquinas** del recuadro amarillo para agrandarlo o achicarlo y "
+               "arrástralo desde el **centro** para moverlo. Luego pulsa *Aplicar recorte*.")
+
+    recortador = _declarar_recortador()
+    crop = None
+    if recortador is not None:
+        valor = recortador(
+            src=_data_url_editor(archivo.getvalue(), rot), w=w, h=h,
+            aspect=None if libre else PROPORCION_RECUADRO[0] / PROPORCION_RECUADRO[1],
+            inicial=list(ed["crop"]) if ed.get("crop") else None,
+            clave=f"{clave}|{rot}|{libre}", alto_max=520,
+            key=f"recortador_{clave}_{rot}_{libre}", default=None,
+        )
+        if isinstance(valor, dict) and all(k in valor for k in ("l", "t", "r", "b")):
+            crop = (valor["l"], valor["t"], valor["r"], valor["b"])
+    modo_guardado = "libre_arrastre" if libre else "arrastre"
+
+    # Plan B por si el recortador no se muestra en algún navegador
+    with st.expander("Alternativa: ajustar con deslizadores"):
+        usar_sl = st.checkbox("Usar deslizadores en vez del recuadro", key=f"usar_sl_{clave}")
+        zoom = st.slider("🔍 Acercar", 100, 300, 100, step=5, format="%d%%", key=f"zoom_{clave}")
+        px = st.slider("↔️ Mover (izquierda – derecha)", 0, 100, 50, key=f"px_{clave}")
+        py = st.slider("↕️ Mover (arriba – abajo)", 0, 100, 50, key=f"py_{clave}")
+        if usar_sl or crop is None:
             crop = calcular_encuadre(w, h, zoom / 100, px / 100, py / 100)
-            nuevo_ajuste = {"modo": "encuadre", "zoom": zoom / 100, "px": px / 100, "py": py / 100}
-        else:
-            m = ajuste.get("margenes", (0, 0, 0, 0))
-            m_izq = st.slider("Recortar izquierda (%)", 0, 90, m[0], key=f"mi_{clave}")
-            m_der = st.slider("Recortar derecha (%)", 0, 90, m[1], key=f"md_{clave}")
-            m_arr = st.slider("Recortar arriba (%)", 0, 90, m[2], key=f"ma_{clave}")
-            m_aba = st.slider("Recortar abajo (%)", 0, 90, m[3], key=f"mb_{clave}")
-            m_der = min(m_der, 95 - m_izq)
-            m_aba = min(m_aba, 95 - m_arr)
-            crop = (m_izq / 100, m_arr / 100, 1 - m_der / 100, 1 - m_aba / 100)
-            nuevo_ajuste = {"modo": "libre", "margenes": (m_izq, m_der, m_arr, m_aba)}
-        st.caption("Así quedará:")
-        st.image(aplicar_edicion(base, {"crop": crop}), use_container_width=True)
-    with col_prev:
-        st.image(_dibujar_marco(base, crop), use_container_width=True,
-                 caption=f"{archivo.name} — lo que está dentro del marco amarillo va al informe")
+            modo_guardado = "encuadre"
+            st.image(_dibujar_marco(base, crop), width=420)
+
+    if crop:
+        c1, _ = st.columns([1, 2])
+        c1.caption("Así quedará en el informe:")
+        c1.image(aplicar_edicion(base, {"crop": crop}), use_container_width=True)
 
     a1, a2, a3 = st.columns(3)
-    if a1.button("✅ Aplicar recorte", type="primary", use_container_width=True, key=f"aplicar_{clave}"):
-        guardar_recorte(clave, crop, nuevo_ajuste)
+    if a1.button("✅ Aplicar recorte", type="primary", use_container_width=True,
+                 key=f"aplicar_{clave}", disabled=crop is None):
+        guardar_recorte(clave, crop, {"modo": modo_guardado})
         st.rerun()
     if a2.button("↩️ Deshacer cambios", use_container_width=True, key=f"deshacer_{clave}",
                  help="Quita la rotación y el recorte de esta foto"):
