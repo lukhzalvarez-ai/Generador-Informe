@@ -997,7 +997,7 @@ with st.sidebar:
         4. Revisa el formulario: viene pre-llenado con lo leído de los PDF.
            Completa la **queja**, el **diagnóstico** y el **trabajo
            realizado** sin límite de caracteres.
-        5. En la sección de fotos puedes ordenarlas (⏮ ◀ ▶), dejar
+        5. En la sección de fotos puedes ordenarlas arrastrándolas, dejar
            fuera las que sobren o estén repetidas (🗑️), rotarlas (↺ ↻)
            y recortarlas (✂️). Las fotos idénticas se excluyen solas.
         6. Genera el informe y descárgalo listo.
@@ -1381,18 +1381,109 @@ _HTML_RECORTADOR = r"""<!DOCTYPE html>
 
 
 @st.cache_resource(show_spinner=False)
-def _declarar_recortador():
-    """Escribe el index.html del componente en una carpeta temporal y lo
-    registra en Streamlit (una sola vez por servidor)."""
+def _declarar_componente(nombre: str, html: str):
+    """Escribe el index.html de un componente propio en una carpeta temporal y
+    lo registra en Streamlit (una sola vez por servidor). None si falla."""
     try:
         import streamlit.components.v1 as components
-        carpeta = Path(tempfile.gettempdir()) / "astara_recortador_v1"
+        carpeta = Path(tempfile.gettempdir()) / f"{nombre}_v1"
         carpeta.mkdir(parents=True, exist_ok=True)
-        (carpeta / "index.html").write_text(_HTML_RECORTADOR, encoding="utf-8")
-        return components.declare_component("astara_recortador", path=str(carpeta))
+        (carpeta / "index.html").write_text(html, encoding="utf-8")
+        return components.declare_component(nombre, path=str(carpeta))
     except Exception as e:
-        logger.error(f"No se pudo preparar el recortador interactivo: {e}")
+        logger.error(f"No se pudo preparar el componente '{nombre}': {e}")
         return None
+
+
+def _declarar_recortador():
+    return _declarar_componente("astara_recortador", _HTML_RECORTADOR)
+
+
+# ---- Ordenador de fotos arrastrando (sin librerías externas) -------------
+_HTML_ORDENADOR = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden;
+               font-family: "Source Sans Pro", "Segoe UI", sans-serif; }
+  #grid { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 2px; }
+  .item { width: 128px; background: #142449; border: 2px solid #2A3F70; border-radius: 8px;
+          padding: 4px; cursor: grab; position: relative; box-sizing: border-box; }
+  .item:active { cursor: grabbing; }
+  .item.prio { border-color: #FFC000; }
+  .item img { width: 100%; height: 70px; object-fit: cover; border-radius: 4px; display: block;
+              pointer-events: none; }
+  .item .n { position: absolute; top: 7px; left: 7px; background: #002060; color: #FFC000;
+             font-weight: 700; border-radius: 4px; padding: 0 6px; font-size: 13px; }
+  .item .nom { color: #E6ECF7; font-size: 11px; white-space: nowrap; overflow: hidden;
+               text-overflow: ellipsis; margin-top: 3px; }
+  .item.arrastrando { opacity: .3; }
+  .item.antes { box-shadow: -6px 0 0 -1px #FFC000; }
+  .item.despues { box-shadow: 6px 0 0 -1px #FFC000; }
+</style></head>
+<body><div id="grid"></div>
+<script>
+  function enviar(tipo, extra) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: tipo}, extra || {}), "*");
+  }
+  var grid = document.getElementById("grid");
+  var items = {}, orden = [], prioritarias = 2, ultimaClave = null, arrastrada = null;
+
+  function ajustarAlto() { enviar("streamlit:setFrameHeight", {height: grid.scrollHeight + 4}); }
+  function limpiarMarcas() {
+    grid.querySelectorAll(".antes, .despues").forEach(function (el) { el.classList.remove("antes", "despues"); });
+  }
+  function dibujar() {
+    grid.innerHTML = "";
+    orden.forEach(function (k, i) {
+      var it = items[k], d = document.createElement("div");
+      d.className = "item" + (i < prioritarias ? " prio" : "");
+      d.draggable = true; d.dataset.k = k;
+      d.title = it.nombre + " — arrastra para mover";
+      d.innerHTML = '<img src="' + it.src + '"><span class="n">' + (i < prioritarias ? "⭐ " : "") +
+                    (i + 1) + '</span><div class="nom"></div>';
+      d.querySelector(".nom").textContent = it.nombre;
+      d.addEventListener("dragstart", function (e) {
+        arrastrada = k; d.classList.add("arrastrando");
+        e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", k);
+      });
+      d.addEventListener("dragend", function () { d.classList.remove("arrastrando"); limpiarMarcas(); arrastrada = null; });
+      d.addEventListener("dragover", function (e) {
+        e.preventDefault(); e.dataTransfer.dropEffect = "move";
+        if (!arrastrada || arrastrada === k) return;
+        var r = d.getBoundingClientRect(), antes = e.clientX < r.left + r.width / 2;
+        limpiarMarcas(); d.classList.add(antes ? "antes" : "despues");
+      });
+      d.addEventListener("drop", function (e) {
+        e.preventDefault();
+        var origen = arrastrada || e.dataTransfer.getData("text/plain");
+        limpiarMarcas();
+        if (!origen || origen === k) return;
+        var r = d.getBoundingClientRect(), antes = e.clientX < r.left + r.width / 2;
+        orden.splice(orden.indexOf(origen), 1);
+        var destino = orden.indexOf(k) + (antes ? 0 : 1);
+        orden.splice(destino, 0, origen);
+        dibujar();
+        enviar("streamlit:setComponentValue", {dataType: "json", value: {orden: orden.slice(), id: Date.now()}});
+      });
+      grid.appendChild(d);
+    });
+    setTimeout(ajustarAlto, 0);
+  }
+  function render(args) {
+    if (args.clave === ultimaClave) return;
+    ultimaClave = args.clave;
+    items = {}; orden = [];
+    prioritarias = args.prioritarias || 2;
+    args.items.forEach(function (it) { items[it.k] = it; orden.push(it.k); });
+    dibujar();
+  }
+  window.addEventListener("message", function (e) {
+    if (e.data && e.data.type === "streamlit:render") render(e.data.args);
+  });
+  window.addEventListener("resize", ajustarAlto);
+  enviar("streamlit:componentReady", {apiVersion: 1});
+</script></body></html>
+"""
 
 
 @st.cache_data(show_spinner=False, max_entries=100)
@@ -1482,7 +1573,7 @@ if clasificacion["imagenes"]:
     st.markdown("#### 🖼️ Fotos del informe")
     st.caption(
         "Así quedarán en el informe y en este orden. ⭐ = alta calidad (las 2 primeras). "
-        "⏮ ◀ ▶ para cambiar el orden · 🗑️ para dejarla fuera · ↺ ↻ para rotar · ✂️ para recortar. "
+        "↺ ↻ para rotar · ✂️ para recortar · 🗑️ para dejarla fuera. "
         "Los cambios se aplican al generar el informe."
     )
     g1, g2, g3, _ = st.columns([1.3, 1.3, 1.3, 2])
@@ -1511,6 +1602,30 @@ if clasificacion["imagenes"]:
                 st.markdown("##### ✂️ Recortar foto")
                 _editor_recorte(archivo_en_recorte)
 
+    # ---- Ordenar arrastrando ----
+    ordenador = _declarar_componente("astara_ordenador", _HTML_ORDENADOR)
+    if ordenador is not None and len(FOTOS_INFORME) > 1:
+        st.markdown("**🔀 Arrastra las fotos para cambiar el orden** "
+                    "· las 2 primeras (borde amarillo) van en alta calidad")
+        items_orden, firma = [], []
+        for a in FOTOS_INFORME:
+            ed = _edicion_de(clave_foto(a))
+            mini = _miniatura_jpeg(a.getvalue(), ed.get("rot", 0), ed.get("crop"), 220)
+            items_orden.append({"k": clave_foto(a), "nombre": a.name,
+                                "src": "data:image/jpeg;base64," + base64.b64encode(mini).decode()})
+            firma.append(f"{clave_foto(a)}:{ed.get('rot', 0)}:{ed.get('crop')}")
+        claves_actuales = [it["k"] for it in items_orden]
+        valor_orden = ordenador(items=items_orden, prioritarias=N_FOTOS_PRIORITARIAS,
+                                clave=str(hash(tuple(firma))), key="ordenador_fotos", default=None)
+        # Se aplica solo un orden NUEVO (cada arrastre trae un id distinto); así no
+        # se pisa lo que se cambie después con otros botones.
+        if isinstance(valor_orden, dict) and valor_orden.get("id") != st.session_state.get("orden_id_aplicado"):
+            st.session_state["orden_id_aplicado"] = valor_orden.get("id")
+            nuevo = [k for k in valor_orden.get("orden", []) if k in claves_actuales]
+            if len(nuevo) == len(claves_actuales) and nuevo != claves_actuales:
+                _guardar_orden(nuevo)
+                st.rerun()
+
     if not FOTOS_INFORME:
         st.info("Todas las fotos quedaron fuera del informe. Puedes volver a incluirlas abajo.")
     total = len(FOTOS_INFORME)
@@ -1534,25 +1649,16 @@ if clasificacion["imagenes"]:
                     st.warning("No se pudo mostrar esta foto.")
                 st.caption(f"{estrella}**{i + 1}.** {calcular_celda_imagen(i)} · {archivo.name}"
                            + (f" · ✏️ {', '.join(marcas)}" if marcas else ""))
-                o1, o2, o3, o4 = st.columns(4)
-                o1.button("⏮", key=f"inicio_{clave}", on_click=foto_al_inicio, args=(clave,),
-                          help="Mover al inicio (queda como foto 1)", use_container_width=True,
-                          disabled=i == 0)
-                o2.button("◀", key=f"antes_{clave}", on_click=mover_foto, args=(clave, -1),
-                          help="Mover una posición antes", use_container_width=True, disabled=i == 0)
-                o3.button("▶", key=f"despues_{clave}", on_click=mover_foto, args=(clave, 1),
-                          help="Mover una posición después", use_container_width=True,
-                          disabled=i == total - 1)
-                o4.button("🗑️", key=f"excluir_{clave}", on_click=excluir_foto, args=(clave,),
-                          help="Dejar fuera del informe (se puede volver a incluir)",
-                          use_container_width=True)
-                b1, b2, b3 = st.columns(3)
+                b1, b2, b3, b4 = st.columns(4)
                 b1.button("↺", key=f"rotizq_{clave}", on_click=rotar_foto, args=(clave, -90),
                           help="Rotar 90° a la izquierda", use_container_width=True)
                 b2.button("↻", key=f"rotder_{clave}", on_click=rotar_foto, args=(clave, 90),
                           help="Rotar 90° a la derecha", use_container_width=True)
                 b3.button("✂️", key=f"recortar_{clave}", on_click=abrir_recorte, args=(clave,),
                           help="Recortar", use_container_width=True)
+                b4.button("🗑️", key=f"excluir_{clave}", on_click=excluir_foto, args=(clave,),
+                          help="Dejar fuera del informe (se puede volver a incluir)",
+                          use_container_width=True)
 
     # ---- Fotos que quedaron fuera ----
     if FOTOS_FUERA:
