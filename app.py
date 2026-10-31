@@ -34,13 +34,24 @@ adjunten (hasta ~25 o más):
 import io
 import re
 import logging
+import unicodedata
 from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 import openpyxl
+from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as XLImage
 from PIL import Image as PILImage, ImageOps
+
+# Soporte opcional para fotos de iPhone (HEIC/HEIF). Requiere 'pillow-heif'
+# en requirements.txt; si no está instalado, esas fotos simplemente se ignoran.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    HEIF_DISPONIBLE = True
+except ImportError:
+    HEIF_DISPONIBLE = False
 
 try:
     import pypdf
@@ -154,11 +165,18 @@ ETIQUETAS_BLOQUE_DIAGNOSTICO = {
     "kmts",
 }
 
-EXTENSIONES_IMAGEN = {"jpg", "jpeg", "png"}
+# Formatos de foto aceptados. HEIC/HEIF (iPhone) solo si 'pillow-heif'
+# está instalado.
+EXTENSIONES_IMAGEN = {"jpg", "jpeg", "jfif", "png", "webp", "bmp", "gif", "tif", "tiff"}
+if HEIF_DISPONIBLE:
+    EXTENSIONES_IMAGEN |= {"heic", "heif"}
 
-# Plantilla predeterminada: se busca junto a este archivo (app.py) en el
-# repositorio. Así no hace falta adjuntarla en cada uso; solo se necesita
-# subir una plantilla distinta si en algún caso puntual se quiere usar otra.
+# Nombres EXACTOS (sin importar mayúsculas, tildes, guiones/guiones bajos ni
+# copias tipo "(1)") que debe tener cada PDF para ser reconocido.
+NOMBRE_PDF_ORDEN = "orden de trabajo"
+NOMBRES_PDF_GARANTIAS = {"trabajo en garantias", "trabajo en garantia"}
+
+# Plantilla: siempre la incluida en el repositorio, junto a este archivo.
 TEMPLATE_FILENAME = "Reporte_de_falla_Astara.xlsx"
 TEMPLATE_PATH = Path(__file__).resolve().parent / TEMPLATE_FILENAME
 
@@ -366,91 +384,100 @@ def validar_campos_criticos(valores: dict) -> list:
 # --------------------------------------------------------------------------
 # Clasificación automática de archivos subidos en el campo único
 # --------------------------------------------------------------------------
-def clasificar_pdf(texto: str, nombre: str) -> str:
-    """Determina si un PDF es 'orden', 'garantias' o 'desconocido',
-    primero por nombre de archivo y, si no es concluyente, por contenido."""
-    nombre_low = nombre.lower()
-    if "garant" in nombre_low:
-        return "garantias"
-    if "orden" in nombre_low and "garant" not in nombre_low:
-        return "orden"
+def normalizar_nombre_archivo(nombre: str) -> str:
+    """Normaliza el nombre (sin extensión) para compararlo:
+    minúsculas, sin tildes, '_' '-' '.' como espacios, sin marcas de copia
+    del navegador/Windows como ' (1)' o ' - copia', y espacios colapsados.
+      'Trabajo_en_Garantías (2).pdf' -> 'trabajo en garantias'"""
+    base = nombre.rsplit(".", 1)[0] if "." in nombre else nombre
+    base = unicodedata.normalize("NFKD", base)
+    base = "".join(c for c in base if not unicodedata.combining(c)).lower()
+    base = re.sub(r"[_\-.]+", " ", base)
+    base = re.sub(r"\s*\(\d+\)\s*$", "", base)        # "(1)", "(2)"...
+    base = re.sub(r"\s+(copia|copy)(\s*\d+)?\s*$", "", base)  # "- copia", "copy 2"
+    return re.sub(r"\s+", " ", base).strip()
 
-    texto_low = texto.lower()
-    marcadores_garantia = ["núm.", "kmts", "% deferencia", "tipo garantía", "fecha reparación"]
-    marcadores_orden = ["vin", "kilómetros", "nº o.t", "queja cliente", "vehículo"]
-    score_g = sum(1 for m in marcadores_garantia if m in texto_low)
-    score_o = sum(1 for m in marcadores_orden if m in texto_low)
-    if score_g > score_o:
-        return "garantias"
-    if score_o > score_g:
+
+def clasificar_pdf(nombre: str) -> str:
+    """Devuelve 'orden', 'garantias' o 'ignorar' SOLO según el nombre.
+    Cualquier PDF con otro nombre se ignora (no se adivina por contenido)."""
+    clave = normalizar_nombre_archivo(nombre)
+    if clave == NOMBRE_PDF_ORDEN:
         return "orden"
-    return "desconocido"
+    if clave in NOMBRES_PDF_GARANTIAS:
+        return "garantias"
+    return "ignorar"
+
+
+def _es_imagen_valida(datos: bytes) -> bool:
+    """Comprueba que el archivo realmente sea una imagen legible (lee solo
+    la cabecera, es rápido)."""
+    try:
+        with PILImage.open(io.BytesIO(datos)) as img:
+            img.verify()
+        return True
+    except Exception:
+        return False
 
 
 def clasificar_archivos_subidos(archivos_subidos: list) -> dict:
     """Recibe la lista de UploadedFile del campo único (puede venir vacía)
-    y los separa en: plantilla Excel (opcional; si no se sube ninguna se
-    usa la plantilla predeterminada incluida en el repositorio), PDF Orden
-    de Trabajo, PDF Garantías e imágenes, deduplicando imágenes por nombre
-    (case-insensitive). Ningún archivo es obligatorio: lo que no se
-    encuentre queda simplemente sin aportar datos."""
+    y se queda SOLO con:
+      - el PDF llamado 'Orden de Trabajo'
+      - el PDF llamado 'Trabajo en Garantías'
+      - las fotos (jpg, jpeg, png, webp, heic, ...), sin repetir nombre
+    Todo lo demás (otros PDF, Excel, Word, etc.) se ignora y se informa.
+    Si se sube más de un PDF con el mismo nombre, se usa el primero."""
     resultado = {
-        "excel_template": None,
         "pdf_orden": None,
         "pdf_orden_nombre": "",
         "pdf_garantias": None,
         "pdf_garantias_nombre": "",
         "imagenes": [],
-        "sin_clasificar": [],
+        "ignorados": [],
     }
     vistos_imagenes = set()
-    pdfs_pendientes = []
 
     for archivo in archivos_subidos:
         nombre = archivo.name
         ext = nombre.lower().rsplit(".", 1)[-1] if "." in nombre else ""
 
-        if ext == "xlsx":
-            if resultado["excel_template"] is None:
-                resultado["excel_template"] = archivo.getvalue()
-            continue
-
         if ext == "pdf":
-            data = archivo.getvalue()
-            texto = extraer_texto_pdf(data, nombre)
-            tipo = clasificar_pdf(texto, nombre)
-            if tipo == "garantias" and resultado["pdf_garantias"] is None:
-                resultado["pdf_garantias"] = texto
-                resultado["pdf_garantias_nombre"] = nombre
-            elif tipo == "orden" and resultado["pdf_orden"] is None:
-                resultado["pdf_orden"] = texto
+            tipo = clasificar_pdf(nombre)
+            if tipo == "orden" and resultado["pdf_orden"] is None:
+                resultado["pdf_orden"] = extraer_texto_pdf(archivo.getvalue(), nombre)
                 resultado["pdf_orden_nombre"] = nombre
+            elif tipo == "garantias" and resultado["pdf_garantias"] is None:
+                resultado["pdf_garantias"] = extraer_texto_pdf(archivo.getvalue(), nombre)
+                resultado["pdf_garantias_nombre"] = nombre
             else:
-                pdfs_pendientes.append((nombre, texto))
+                resultado["ignorados"].append(nombre)
             continue
 
         if ext in EXTENSIONES_IMAGEN:
             clave = nombre.lower()
-            if clave not in vistos_imagenes:
-                vistos_imagenes.add(clave)
-                resultado["imagenes"].append(archivo)
+            if clave in vistos_imagenes or not _es_imagen_valida(archivo.getvalue()):
+                resultado["ignorados"].append(nombre)
+                continue
+            vistos_imagenes.add(clave)
+            resultado["imagenes"].append(archivo)
             continue
 
-        resultado["sin_clasificar"].append(nombre)
+        resultado["ignorados"].append(nombre)
 
-    # Los PDF que no se pudieron clasificar por contenido/nombre se asignan
-    # a los huecos que queden, en el orden en que se subieron.
-    for nombre, texto in pdfs_pendientes:
-        if resultado["pdf_orden"] is None:
-            resultado["pdf_orden"] = texto
-            resultado["pdf_orden_nombre"] = nombre
-        elif resultado["pdf_garantias"] is None:
-            resultado["pdf_garantias"] = texto
-            resultado["pdf_garantias_nombre"] = nombre
-        else:
-            resultado["sin_clasificar"].append(nombre)
-
+    # Orden natural por nombre ("1", "2", ..., "10", "IMG_...", "WhatsApp..."):
+    # así el orden no depende de cómo el navegador entregue los archivos, y
+    # basta con nombrar "1" y "2" las fotos más importantes para que sean
+    # las prioritarias (alta calidad) y queden primeras en el reporte.
+    resultado["imagenes"].sort(key=lambda a: _clave_orden_natural(a.name))
     return resultado
+
+
+def _clave_orden_natural(nombre: str) -> list:
+    """'foto 10.jpg' va después de 'foto 2.jpg' (no antes, como en orden
+    alfabético simple)."""
+    base = nombre.rsplit(".", 1)[0].lower()
+    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.split(r"(\d+)", base) if t]
 
 
 # --------------------------------------------------------------------------
@@ -598,11 +625,27 @@ def insertar_imagenes(ws, imagenes_jpeg: list, nombres: list) -> int:
 # --------------------------------------------------------------------------
 # Generación del reporte
 # --------------------------------------------------------------------------
+def _escribir_celda(ws, coordenada: str, valor) -> None:
+    """Escribe un valor aunque la celda forme parte de un rango combinado
+    (en ese caso se escribe en la celda superior izquierda del rango, que
+    es la única editable). Evita el error "'MergedCell' object attribute
+    'value' is read-only"."""
+    celda = ws[coordenada]
+    if isinstance(celda, MergedCell):
+        for rango in ws.merged_cells.ranges:
+            if coordenada in rango:
+                ws.cell(row=rango.min_row, column=rango.min_col).value = valor
+                return
+        logger.warning(f"No se pudo escribir en la celda combinada {coordenada}.")
+        return
+    celda.value = valor
+
+
 def _armar_excel(plantilla_bytes: bytes, valores: dict, imagenes_jpeg: list, nombres: list) -> tuple:
     wb = openpyxl.load_workbook(io.BytesIO(plantilla_bytes))
     ws = wb.active
     for campo, celda in CELDAS_EXCEL.items():
-        ws[celda] = valores.get(campo, "")
+        _escribir_celda(ws, celda, valores.get(campo, ""))
     n_insertadas = insertar_imagenes(ws, imagenes_jpeg, nombres)
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -641,12 +684,11 @@ def generar_reporte(clasificacion: dict) -> tuple:
     }
     faltantes = validar_campos_criticos(valores)
 
-    plantilla_bytes = clasificacion["excel_template"] or cargar_plantilla_predeterminada()
+    plantilla_bytes = cargar_plantilla_predeterminada()
     if not plantilla_bytes:
         raise RuntimeError(
-            f"No se encontró la plantilla predeterminada ('{TEMPLATE_FILENAME}') junto a la app "
-            "y tampoco se adjuntó una plantilla .xlsx. Sube una plantilla o agrega el archivo "
-            f"'{TEMPLATE_FILENAME}' al repositorio."
+            f"No se encontró la plantilla '{TEMPLATE_FILENAME}' junto a la app. "
+            f"Agrega el archivo '{TEMPLATE_FILENAME}' al repositorio."
         )
 
     fotos = [(a.name, a.getvalue()) for a in clasificacion["imagenes"]]
@@ -838,38 +880,38 @@ with st.sidebar:
     st.markdown("### ℹ️ Cómo usar la app")
     st.markdown(
         """
-        1. Arrastra los archivos que tengas al campo de carga (ninguno es
+        1. Arrastra los archivos al campo de carga (ninguno es
            obligatorio, usa los que tengas a mano):
            - `Orden de Trabajo.pdf`
            - `Trabajo en Garantías.pdf`
-           - Fotos del vehículo (`.jpg`, `.jpeg`, `.png`)
-        2. La plantilla del **Reporte Técnico Astara ya viene integrada**,
-           no hace falta adjuntarla (solo si quieres usar una distinta a
-           la de siempre).
-        3. La app detecta sola qué es cada archivo que subas.
+           - Fotos del vehículo
+        2. Los PDF **deben llamarse exactamente así**. Cualquier otro
+           PDF, Excel, Word, etc. se ignora automáticamente.
+        3. La plantilla del **Reporte Técnico Astara ya viene integrada**.
         4. Genera el reporte: lo que no se haya adjuntado queda en blanco
            para completar a mano.
         5. Revisa la vista previa y descarga el reporte final.
         """
     )
+    st.caption("Formatos de foto aceptados: " + ", ".join(sorted(EXTENSIONES_IMAGEN)).upper())
     st.divider()
     st.markdown("### 📦 Peso del reporte")
     st.markdown(
         f"""
         El reporte **nunca supera {LIMITE_REPORTE_BYTES // MB} MB**.
-        - Las **{N_FOTOS_PRIORITARIAS} primeras fotos** se guardan siempre en alta calidad
-          (súbelas primero si son las más importantes).
+        - Las fotos se ordenan **por nombre** (1, 2, 3… y luego el resto).
+        - Las **{N_FOTOS_PRIORITARIAS} primeras** se guardan siempre en alta calidad:
+          nombra **"1"** y **"2"** las más importantes (ej. VIN y tablero).
         - Las demás solo se comprimen si es necesario para no pasar el límite.
         """
     )
-    st.divider()
-    st.caption("No es necesario un campo por tipo de archivo: todo se sube junto y la app los diferencia automáticamente.")
     if not PLANTILLA_PREDETERMINADA_DISPONIBLE:
-        st.error(f"No se encontró '{TEMPLATE_FILENAME}' junto a la app. Agrégalo al repositorio o súbelo manualmente en el campo de carga.")
+        st.error(f"No se encontró '{TEMPLATE_FILENAME}' junto a la app. Agrégalo al repositorio.")
 
+# Sin filtro de tipo en el cargador: así el usuario puede arrastrar una
+# carpeta completa sin errores, y la app descarta lo que no corresponde.
 archivos_subidos = st.file_uploader(
-    "Adjunta aquí lo que tengas: Orden de Trabajo, Trabajo en Garantías y/o fotos (todo opcional)",
-    type=["pdf", "xlsx", "jpg", "jpeg", "png"],
+    "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf' y/o fotos (todo opcional; lo demás se ignora)",
     accept_multiple_files=True,
 )
 
@@ -877,10 +919,8 @@ clasificacion = clasificar_archivos_subidos(archivos_subidos or [])
 
 st.markdown("#### 📎 Archivos detectados")
 badges = []
-if clasificacion["excel_template"]:
-    badges.append('<span class="astara-badge ok">Plantilla: ✔ personalizada cargada</span>')
-elif PLANTILLA_PREDETERMINADA_DISPONIBLE:
-    badges.append('<span class="astara-badge ok">Plantilla: ✔ predeterminada integrada</span>')
+if PLANTILLA_PREDETERMINADA_DISPONIBLE:
+    badges.append('<span class="astara-badge ok">Plantilla: ✔ integrada</span>')
 else:
     badges.append('<span class="astara-badge missing">Plantilla: ✘ no disponible</span>')
 badges.append(
@@ -898,8 +938,14 @@ badges.append(
 st.markdown(" ".join(badges), unsafe_allow_html=True)
 st.caption("Nada es obligatorio: lo que no adjuntes simplemente queda vacío en el reporte para completarlo a mano.")
 
-if clasificacion["sin_clasificar"]:
-    st.warning("Archivos que no se pudieron clasificar y fueron ignorados: " + ", ".join(clasificacion["sin_clasificar"]))
+if clasificacion["ignorados"]:
+    n_ign = len(clasificacion["ignorados"])
+    with st.expander(f"🚫 {n_ign} archivo(s) ignorado(s) por no corresponder (clic para ver)"):
+        st.caption(
+            "Solo se usan los PDF llamados exactamente 'Orden de Trabajo' y 'Trabajo en Garantías', "
+            "y las fotos. Si un PDF que necesitas aparece aquí, cámbiale el nombre y vuelve a subirlo."
+        )
+        st.markdown("\n".join(f"- {n}" for n in clasificacion["ignorados"]))
 
 generar = st.button("⚙️ Generar Reporte Técnico Astara", type="primary", use_container_width=True)
 
@@ -966,7 +1012,12 @@ if generar:
             for i, archivo in enumerate(clasificacion["imagenes"]):
                 etiqueta = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
                 with columnas[i % 4]:
-                    st.image(archivo.getvalue(), caption=f"{etiqueta}{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
+                    try:
+                        # Miniatura liviana (también sirve para HEIC, que el navegador no muestra)
+                        miniatura = _abrir_normalizada(archivo.getvalue(), 600)
+                        st.image(miniatura, caption=f"{etiqueta}{calcular_celda_imagen(i)} · {archivo.name}", use_container_width=True)
+                    except Exception:
+                        st.caption(f"{etiqueta}{calcular_celda_imagen(i)} · {archivo.name}")
             st.caption(f"⭐ = foto prioritaria (se conserva en alta calidad).")
         else:
             st.info("No se adjuntaron fotos; el reporte queda sin imágenes insertadas.")
