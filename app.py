@@ -42,7 +42,7 @@ import pandas as pd
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 from openpyxl.drawing.image import Image as XLImage
-from PIL import Image as PILImage, ImageOps
+from PIL import Image as PILImage, ImageOps, ImageDraw
 
 # Soporte opcional para fotos de iPhone (HEIC/HEIF). Requiere 'pillow-heif'
 # en requirements.txt; si no está instalado, esas fotos simplemente se ignoran.
@@ -52,14 +52,6 @@ try:
     HEIF_DISPONIBLE = True
 except ImportError:
     HEIF_DISPONIBLE = False
-
-# Recorte interactivo (arrastrar el recuadro). Requiere 'streamlit-cropper' en
-# requirements.txt; si no está, la app ofrece recorte con deslizadores.
-try:
-    from streamlit_cropper import st_cropper
-    CROPPER_DISPONIBLE = True
-except Exception:
-    CROPPER_DISPONIBLE = False
 
 try:
     import pypdf
@@ -716,7 +708,8 @@ def _ajustar_alto_celda_texto(ws, coordenada: str, texto: str) -> None:
     )
 
 
-CAMPOS_TEXTO_LARGO = ("queja_cliente", "diagnostico_tecnico", "repuestos_usados", "trabajo_realizado")
+# C20 (repuestos) mantiene el alto original de la plantilla aunque no se vea todo.
+CAMPOS_TEXTO_LARGO = ("queja_cliente", "diagnostico_tecnico", "trabajo_realizado")
 
 
 def _armar_excel(plantilla_bytes: bytes, valores: dict, imagenes_jpeg: list, nombres: list) -> tuple:
@@ -1087,6 +1080,7 @@ def rotar_foto(clave: str, grados: int) -> None:
     ed = dict(_edicion_de(clave))
     ed["rot"] = (ed.get("rot", 0) + grados) % 360
     ed["crop"] = None  # el recorte se definió sobre la orientación anterior
+    ed["ajuste"] = None
     EDICIONES[clave] = ed
 
 
@@ -1098,9 +1092,10 @@ def cerrar_recorte() -> None:
     st.session_state.pop("foto_en_recorte", None)
 
 
-def guardar_recorte(clave: str, crop) -> None:
+def guardar_recorte(clave: str, crop, ajuste: dict = None) -> None:
     ed = dict(_edicion_de(clave))
     ed["crop"] = crop
+    ed["ajuste"] = ajuste   # parámetros usados, para reabrir el editor igual
     EDICIONES[clave] = ed
     cerrar_recorte()
 
@@ -1110,57 +1105,107 @@ def restablecer_foto(clave: str) -> None:
     cerrar_recorte()
 
 
+@st.cache_data(show_spinner=False, max_entries=300)
+def _base_editor(datos: bytes, rot: int) -> PILImage.Image:
+    """Versión liviana (máx. 700 px) de la foto, rotada y sin recortar, para el
+    editor y para calcular encuadres. Se guarda en caché: el editor responde rápido."""
+    return _abrir_normalizada(datos, 700, {"rot": rot})
+
+
+def calcular_encuadre(w: int, h: int, zoom: float = 1.0, px: float = 0.5, py: float = 0.5) -> tuple:
+    """Recorte con la MISMA forma que el recuadro de la foto en el informe
+    (así no sale estirada). zoom 1 = el recorte más grande que cabe en la foto;
+    px/py = posición 0-1 (izquierda→derecha, arriba→abajo). Nunca se sale de la foto."""
+    proporcion = PROPORCION_RECUADRO[0] / PROPORCION_RECUADRO[1]
+    if w / h > proporcion:
+        alto, ancho = h, h * proporcion
+    else:
+        ancho, alto = w, w / proporcion
+    ancho, alto = ancho / zoom, alto / zoom
+    izq, arr = px * (w - ancho), py * (h - alto)
+    return (izq / w, arr / h, (izq + ancho) / w, (arr + alto) / h)
+
+
+def _dibujar_marco(img: PILImage.Image, crop) -> PILImage.Image:
+    """Oscurece lo que queda fuera del recorte y dibuja un marco amarillo."""
+    w, h = img.size
+    caja = (crop[0] * w, crop[1] * h, crop[2] * w - 1, crop[3] * h - 1)
+    mascara = PILImage.new("L", img.size, 150)
+    ImageDraw.Draw(mascara).rectangle(caja, fill=0)
+    salida = PILImage.composite(PILImage.new("RGB", img.size, (0, 0, 0)), img, mascara)
+    ImageDraw.Draw(salida).rectangle(caja, outline=(255, 192, 0), width=4)
+    return salida
+
+
+def encuadrar_todas(archivos: list) -> None:
+    """Aplica a todas las fotos SIN recorte propio un encuadre centrado con la
+    forma del recuadro del informe. Las que ya se recortaron a mano no se tocan."""
+    for archivo in archivos:
+        clave = clave_foto(archivo)
+        ed = dict(_edicion_de(clave))
+        if ed.get("crop"):
+            continue
+        try:
+            w, h = _base_editor(archivo.getvalue(), ed.get("rot", 0)).size
+        except Exception:
+            continue
+        ed["crop"] = calcular_encuadre(w, h)
+        ed["ajuste"] = {"modo": "encuadre", "zoom": 1.0, "px": 0.5, "py": 0.5}
+        EDICIONES[clave] = ed
+
+
+def quitar_recortes_todas(archivos: list) -> None:
+    for archivo in archivos:
+        clave = clave_foto(archivo)
+        if clave in EDICIONES:
+            EDICIONES[clave] = {**EDICIONES[clave], "crop": None, "ajuste": None}
+
+
 def _editor_recorte(archivo) -> None:
-    """Contenido del editor de recorte de UNA foto. Se muestra dentro de una
-    ventana emergente (st.dialog) para que aparezca a la vista sin importar
-    dónde esté la foto en la página."""
+    """Editor de recorte de UNA foto (dentro de una ventana emergente). Usa
+    deslizadores sobre una copia liviana en caché, así responde al instante."""
     clave = clave_foto(archivo)
     ed = _edicion_de(clave)
-    st.markdown(f"**{archivo.name}**")
-    libre = st.checkbox(
-        "Proporción libre", value=False, key=f"libre_{clave}",
-        help="Por defecto el recorte usa la forma del recuadro de la foto en el informe, "
-             "así la foto no se ve estirada ni aplastada.",
-    )
-    # Imagen base: rotada pero SIN recortar, de máx. 600 px para que el
-    # recortador no la reescale (las coordenadas quedan en sus píxeles).
-    base = _abrir_normalizada(archivo.getvalue(), 600, {"rot": ed.get("rot", 0)})
+    ajuste = ed.get("ajuste") or {}
+    base = _base_editor(archivo.getvalue(), ed.get("rot", 0))
     w, h = base.size
-    nuevo_crop = None
-    usar_deslizadores = not CROPPER_DISPONIBLE
-    if CROPPER_DISPONIBLE:
-        st.caption("Arrastra y ajusta el recuadro amarillo sobre la zona que quieres conservar.")
-        try:
-            caja = st_cropper(
-                base, realtime_update=True, box_color="#FFC000",
-                aspect_ratio=None if libre else PROPORCION_RECUADRO,
-                return_type="box", key=f"cropper_{clave}_{libre}",
-            )
-            izq, arr = caja["left"] / w, caja["top"] / h
-            nuevo_crop = (izq, arr, izq + caja["width"] / w, arr + caja["height"] / h)
-        except Exception as e:  # si el componente falla, se usa el plan B
-            logger.error(f"Recortador interactivo no disponible: {e}")
-            usar_deslizadores = True
-    if usar_deslizadores:
-        st.caption("Ajusta cuánto recortar de cada borde (en %).")
-        c1, c2 = st.columns(2)
-        m_izq = c1.slider("Recortar a la izquierda", 0, 90, 0, key=f"mi_{clave}")
-        m_der = c1.slider("Recortar a la derecha", 0, 90, 0, key=f"md_{clave}")
-        m_arr = c2.slider("Recortar arriba", 0, 90, 0, key=f"ma_{clave}")
-        m_aba = c2.slider("Recortar abajo", 0, 90, 0, key=f"mb_{clave}")
-        if m_izq + m_der < 95 and m_arr + m_aba < 95:
-            nuevo_crop = (m_izq / 100, m_arr / 100, 1 - m_der / 100, 1 - m_aba / 100)
-        else:
-            st.warning("El recorte deja la foto vacía; reduce los márgenes.")
 
-    if nuevo_crop:
-        st.caption("Vista previa del resultado:")
-        st.image(aplicar_edicion(base, {"crop": nuevo_crop}), width=360)
+    modo = st.radio(
+        "Tipo de recorte", ["📐 Forma del informe", "✂️ Libre"], horizontal=True,
+        index=1 if ajuste.get("modo") == "libre" else 0, key=f"modo_{clave}",
+        help="'Forma del informe' recorta con la misma forma del recuadro de la foto en el Excel, "
+             "así no sale estirada. 'Libre' permite recortar cada borde por separado.",
+    )
+    col_ctrl, col_prev = st.columns([1, 2])
+    with col_ctrl:
+        if modo.startswith("📐"):
+            zoom = st.slider("🔍 Acercar", 100, 300, int(round(ajuste.get("zoom", 1.0) * 100)),
+                             step=5, format="%d%%", key=f"zoom_{clave}")
+            px = st.slider("↔️ Mover (izquierda – derecha)", 0, 100,
+                           int(round(ajuste.get("px", 0.5) * 100)), key=f"px_{clave}")
+            py = st.slider("↕️ Mover (arriba – abajo)", 0, 100,
+                           int(round(ajuste.get("py", 0.5) * 100)), key=f"py_{clave}")
+            crop = calcular_encuadre(w, h, zoom / 100, px / 100, py / 100)
+            nuevo_ajuste = {"modo": "encuadre", "zoom": zoom / 100, "px": px / 100, "py": py / 100}
+        else:
+            m = ajuste.get("margenes", (0, 0, 0, 0))
+            m_izq = st.slider("Recortar izquierda (%)", 0, 90, m[0], key=f"mi_{clave}")
+            m_der = st.slider("Recortar derecha (%)", 0, 90, m[1], key=f"md_{clave}")
+            m_arr = st.slider("Recortar arriba (%)", 0, 90, m[2], key=f"ma_{clave}")
+            m_aba = st.slider("Recortar abajo (%)", 0, 90, m[3], key=f"mb_{clave}")
+            m_der = min(m_der, 95 - m_izq)
+            m_aba = min(m_aba, 95 - m_arr)
+            crop = (m_izq / 100, m_arr / 100, 1 - m_der / 100, 1 - m_aba / 100)
+            nuevo_ajuste = {"modo": "libre", "margenes": (m_izq, m_der, m_arr, m_aba)}
+        st.caption("Así quedará:")
+        st.image(aplicar_edicion(base, {"crop": crop}), use_container_width=True)
+    with col_prev:
+        st.image(_dibujar_marco(base, crop), use_container_width=True,
+                 caption=f"{archivo.name} — lo que está dentro del marco amarillo va al informe")
 
     a1, a2, a3 = st.columns(3)
-    if a1.button("✅ Aplicar recorte", type="primary", use_container_width=True,
-                 disabled=nuevo_crop is None, key=f"aplicar_{clave}"):
-        guardar_recorte(clave, nuevo_crop)
+    if a1.button("✅ Aplicar recorte", type="primary", use_container_width=True, key=f"aplicar_{clave}"):
+        guardar_recorte(clave, crop, nuevo_ajuste)
         st.rerun()
     if a2.button("↩️ Deshacer cambios", use_container_width=True, key=f"deshacer_{clave}",
                  help="Quita la rotación y el recorte de esta foto"):
@@ -1189,6 +1234,14 @@ if clasificacion["imagenes"]:
         "Así quedarán en el informe y en este orden. ⭐ = alta calidad. "
         "Usa ↺ ↻ para rotar y ✂️ para recortar; los cambios se aplican al generar el informe."
     )
+    g1, g2, _ = st.columns([1.4, 1.4, 3])
+    g1.button("📐 Encuadrar todas", on_click=encuadrar_todas, args=(clasificacion["imagenes"],),
+              use_container_width=True,
+              help="Recorta de una vez todas las fotos a la forma del recuadro del informe (centradas), "
+                   "para que no salgan estiradas. Las que ya recortaste a mano no se modifican. "
+                   "Después puedes ajustar cualquiera con ✂️.")
+    g2.button("🧹 Quitar todos los recortes", on_click=quitar_recortes_todas,
+              args=(clasificacion["imagenes"],), use_container_width=True)
 
     # ---- Editor de recorte (una foto a la vez) ----
     clave_abierta = st.session_state.get("foto_en_recorte")
