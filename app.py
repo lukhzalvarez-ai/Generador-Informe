@@ -997,8 +997,9 @@ with st.sidebar:
         4. Revisa el formulario: viene pre-llenado con lo leído de los PDF.
            Completa la **queja**, el **diagnóstico** y el **trabajo
            realizado** sin límite de caracteres.
-        5. Si alguna foto quedó chueca o con sobrante, rótala (↺ ↻) o
-           recórtala (✂️) en la sección de fotos.
+        5. En la sección de fotos puedes ordenarlas (⏮ ◀ ▶), dejar
+           fuera las que sobren o estén repetidas (🗑️), rotarlas (↺ ↻)
+           y recortarlas (✂️). Las fotos idénticas se excluyen solas.
         6. Genera el informe y descárgalo listo.
         """
     )
@@ -1026,6 +1027,92 @@ archivos_subidos = st.file_uploader(
 
 clasificacion = clasificar_archivos_subidos(archivos_subidos or [])
 
+
+# --------------------------------------------------------------------------
+# Orden y selección de fotos (mover / quitar del informe)
+# --------------------------------------------------------------------------
+def _sincronizar_fotos(imagenes: list) -> tuple:
+    """Mantiene en la sesión el orden elegido y las fotos excluidas.
+    - Fotos nuevas se agregan al final (en orden por nombre).
+    - Fotos idénticas (mismo contenido, otro nombre) se excluyen solas UNA vez;
+      si el usuario la vuelve a incluir, se respeta.
+    Devuelve (fotos_del_informe_en_orden, fotos_excluidas, por_clave)."""
+    import hashlib
+    por_clave = {clave_foto(a): a for a in imagenes}
+    claves = list(por_clave)
+    orden = [c for c in st.session_state.get("orden_fotos", []) if c in por_clave]
+    orden += [c for c in claves if c not in orden]
+    st.session_state["orden_fotos"] = orden
+
+    excluidas = st.session_state.setdefault("fotos_excluidas", {})   # clave -> motivo
+    for c in list(excluidas):
+        if c not in por_clave:
+            del excluidas[c]
+    hashes = st.session_state.setdefault("hash_fotos", {})            # clave -> md5
+    revisadas = st.session_state.setdefault("fotos_revisadas_dup", set())
+    vistos = {}
+    for c in orden:
+        if c not in hashes:
+            hashes[c] = hashlib.md5(por_clave[c].getvalue()).hexdigest()
+        h = hashes[c]
+        if h in vistos and c not in revisadas and c not in excluidas:
+            excluidas[c] = f"duplicada: idéntica a {por_clave[vistos[h]].name}"
+        vistos.setdefault(h, c)
+        revisadas.add(c)
+
+    incluidas = [por_clave[c] for c in orden if c not in excluidas]
+    fuera = [por_clave[c] for c in orden if c in excluidas]
+    return incluidas, fuera, por_clave
+
+
+def _claves_incluidas() -> list:
+    excl = st.session_state.get("fotos_excluidas", {})
+    return [c for c in st.session_state.get("orden_fotos", []) if c not in excl]
+
+
+def _guardar_orden(incluidas: list) -> None:
+    excl = st.session_state.get("fotos_excluidas", {})
+    resto = [c for c in st.session_state.get("orden_fotos", []) if c in excl]
+    st.session_state["orden_fotos"] = incluidas + resto
+
+
+def mover_foto(clave: str, delta: int) -> None:
+    inc = _claves_incluidas()
+    if clave not in inc:
+        return
+    i = inc.index(clave)
+    j = max(0, min(len(inc) - 1, i + delta))
+    inc.insert(j, inc.pop(i))
+    _guardar_orden(inc)
+
+
+def foto_al_inicio(clave: str) -> None:
+    inc = _claves_incluidas()
+    if clave in inc:
+        inc.remove(clave)
+        _guardar_orden([clave] + inc)
+
+
+def excluir_foto(clave: str) -> None:
+    st.session_state.setdefault("fotos_excluidas", {})[clave] = "quitada a mano"
+    if st.session_state.get("foto_en_recorte") == clave:
+        st.session_state.pop("foto_en_recorte", None)
+
+
+def incluir_foto(clave: str) -> None:
+    st.session_state.setdefault("fotos_excluidas", {}).pop(clave, None)
+    inc = _claves_incluidas()            # vuelve al final del informe
+    if clave in inc:
+        inc.remove(clave)
+        _guardar_orden(inc + [clave])
+
+
+def ordenar_por_nombre(imagenes: list) -> None:
+    st.session_state["orden_fotos"] = [clave_foto(a) for a in imagenes]   # ya vienen en orden natural
+
+
+FOTOS_INFORME, FOTOS_FUERA, _ = _sincronizar_fotos(clasificacion["imagenes"])
+
 st.markdown("#### 📎 Archivos detectados")
 badges = []
 if PLANTILLA_PREDETERMINADA_DISPONIBLE:
@@ -1041,8 +1128,9 @@ badges.append(
     f'Trabajo en Garantías: {clasificacion["pdf_garantias_nombre"] or "no adjuntada"}</span>'
 )
 badges.append(
-    f'<span class="astara-badge {"ok" if clasificacion["imagenes"] else "warn"}">'
-    f'Fotos: {len(clasificacion["imagenes"])}</span>'
+    f'<span class="astara-badge {"ok" if FOTOS_INFORME else "warn"}">'
+    f'Fotos: {len(FOTOS_INFORME)}'
+    + (f' (+{len(FOTOS_FUERA)} fuera del informe)' if FOTOS_FUERA else '') + '</span>'
 )
 st.markdown(" ".join(badges), unsafe_allow_html=True)
 st.caption("Nada es obligatorio: lo que no adjuntes simplemente queda vacío en el reporte para completarlo a mano.")
@@ -1393,23 +1481,25 @@ else:
 if clasificacion["imagenes"]:
     st.markdown("#### 🖼️ Fotos del informe")
     st.caption(
-        "Así quedarán en el informe y en este orden. ⭐ = alta calidad. "
-        "Usa ↺ ↻ para rotar y ✂️ para recortar; los cambios se aplican al generar el informe."
+        "Así quedarán en el informe y en este orden. ⭐ = alta calidad (las 2 primeras). "
+        "⏮ ◀ ▶ para cambiar el orden · 🗑️ para dejarla fuera · ↺ ↻ para rotar · ✂️ para recortar. "
+        "Los cambios se aplican al generar el informe."
     )
-    g1, g2, _ = st.columns([1.4, 1.4, 3])
-    g1.button("📐 Encuadrar todas", on_click=encuadrar_todas, args=(clasificacion["imagenes"],),
+    g1, g2, g3, _ = st.columns([1.3, 1.3, 1.3, 2])
+    g1.button("📐 Encuadrar todas", on_click=encuadrar_todas, args=(FOTOS_INFORME,),
               use_container_width=True,
               help="Recorta de una vez todas las fotos a la forma del recuadro del informe (centradas), "
                    "para que no salgan estiradas. Las que ya recortaste a mano no se modifican. "
                    "Después puedes ajustar cualquiera con ✂️.")
     g2.button("🧹 Quitar todos los recortes", on_click=quitar_recortes_todas,
-              args=(clasificacion["imagenes"],), use_container_width=True)
+              args=(FOTOS_INFORME,), use_container_width=True)
+    g3.button("🔤 Ordenar por nombre", on_click=ordenar_por_nombre,
+              args=(clasificacion["imagenes"],), use_container_width=True,
+              help="Vuelve al orden original (1, 2, 3… y luego el resto por nombre).")
 
     # ---- Editor de recorte (una foto a la vez) ----
     clave_abierta = st.session_state.get("foto_en_recorte")
-    archivo_en_recorte = next(
-        (a for a in clasificacion["imagenes"] if clave_foto(a) == clave_abierta), None
-    )
+    archivo_en_recorte = next((a for a in FOTOS_INFORME if clave_foto(a) == clave_abierta), None)
     if archivo_en_recorte is not None:
         if _dialogo_recorte is not None:
             # La ventana se mantiene abierta sola mientras se usa; se limpia la
@@ -1421,31 +1511,67 @@ if clasificacion["imagenes"]:
                 st.markdown("##### ✂️ Recortar foto")
                 _editor_recorte(archivo_en_recorte)
 
-    columnas = st.columns(4)
-    for i, archivo in enumerate(clasificacion["imagenes"]):
-        clave = clave_foto(archivo)
-        ed = _edicion_de(clave)
-        marcas = []
-        if ed.get("rot"):
-            marcas.append(f"rotada {ed['rot']}°")
-        if ed.get("crop"):
-            marcas.append("recortada")
-        estrella = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
-        with columnas[i % 4]:
-            try:
-                st.image(_miniatura_jpeg(archivo.getvalue(), ed.get("rot", 0), ed.get("crop"), 480),
-                         use_container_width=True)
-            except Exception:
-                st.warning("No se pudo mostrar esta foto.")
-            st.caption(f"{estrella}{i + 1}. {calcular_celda_imagen(i)} · {archivo.name}"
-                       + (f" · ✏️ {', '.join(marcas)}" if marcas else ""))
-            b1, b2, b3 = st.columns(3)
-            b1.button("↺", key=f"rotizq_{i}", on_click=rotar_foto, args=(clave, -90),
-                      help="Rotar 90° a la izquierda", use_container_width=True)
-            b2.button("↻", key=f"rotder_{i}", on_click=rotar_foto, args=(clave, 90),
-                      help="Rotar 90° a la derecha", use_container_width=True)
-            b3.button("✂️", key=f"recortar_{i}", on_click=abrir_recorte, args=(clave,),
-                      help="Recortar", use_container_width=True)
+    if not FOTOS_INFORME:
+        st.info("Todas las fotos quedaron fuera del informe. Puedes volver a incluirlas abajo.")
+    total = len(FOTOS_INFORME)
+    for inicio in range(0, total, 4):          # filas de 4 para que el orden se lea claro
+        columnas = st.columns(4)
+        for j, archivo in enumerate(FOTOS_INFORME[inicio:inicio + 4]):
+            i = inicio + j
+            clave = clave_foto(archivo)
+            ed = _edicion_de(clave)
+            marcas = []
+            if ed.get("rot"):
+                marcas.append(f"rotada {ed['rot']}°")
+            if ed.get("crop"):
+                marcas.append("recortada")
+            estrella = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
+            with columnas[j]:
+                try:
+                    st.image(_miniatura_jpeg(archivo.getvalue(), ed.get("rot", 0), ed.get("crop"), 480),
+                             use_container_width=True)
+                except Exception:
+                    st.warning("No se pudo mostrar esta foto.")
+                st.caption(f"{estrella}**{i + 1}.** {calcular_celda_imagen(i)} · {archivo.name}"
+                           + (f" · ✏️ {', '.join(marcas)}" if marcas else ""))
+                o1, o2, o3, o4 = st.columns(4)
+                o1.button("⏮", key=f"inicio_{clave}", on_click=foto_al_inicio, args=(clave,),
+                          help="Mover al inicio (queda como foto 1)", use_container_width=True,
+                          disabled=i == 0)
+                o2.button("◀", key=f"antes_{clave}", on_click=mover_foto, args=(clave, -1),
+                          help="Mover una posición antes", use_container_width=True, disabled=i == 0)
+                o3.button("▶", key=f"despues_{clave}", on_click=mover_foto, args=(clave, 1),
+                          help="Mover una posición después", use_container_width=True,
+                          disabled=i == total - 1)
+                o4.button("🗑️", key=f"excluir_{clave}", on_click=excluir_foto, args=(clave,),
+                          help="Dejar fuera del informe (se puede volver a incluir)",
+                          use_container_width=True)
+                b1, b2, b3 = st.columns(3)
+                b1.button("↺", key=f"rotizq_{clave}", on_click=rotar_foto, args=(clave, -90),
+                          help="Rotar 90° a la izquierda", use_container_width=True)
+                b2.button("↻", key=f"rotder_{clave}", on_click=rotar_foto, args=(clave, 90),
+                          help="Rotar 90° a la derecha", use_container_width=True)
+                b3.button("✂️", key=f"recortar_{clave}", on_click=abrir_recorte, args=(clave,),
+                          help="Recortar", use_container_width=True)
+
+    # ---- Fotos que quedaron fuera ----
+    if FOTOS_FUERA:
+        motivos = st.session_state.get("fotos_excluidas", {})
+        with st.expander(f"🗑️ Fotos fuera del informe ({len(FOTOS_FUERA)}) — clic para ver o volver a incluir"):
+            columnas_fuera = st.columns(6)
+            for k, archivo in enumerate(FOTOS_FUERA):
+                clave = clave_foto(archivo)
+                ed = _edicion_de(clave)
+                with columnas_fuera[k % 6]:
+                    try:
+                        st.image(_miniatura_jpeg(archivo.getvalue(), ed.get("rot", 0), ed.get("crop"), 300),
+                                 use_container_width=True)
+                    except Exception:
+                        pass
+                    st.caption(f"{archivo.name} · {motivos.get(clave, '')}")
+                    st.button("↩️ Incluir", key=f"incluir_{clave}", on_click=incluir_foto,
+                              args=(clave,), use_container_width=True,
+                              help="Vuelve a agregarla al final del informe")
 
 # --------------------------------------------------------------------------
 # Paso 2: revisar / completar los textos antes de generar
@@ -1510,13 +1636,13 @@ if generar:
     valores = {campo: (st.session_state.get(f"campo_{campo}", "") or "").strip() for campo in CELDAS_EXCEL}
     faltantes = validar_campos_criticos(valores)
 
-    n_fotos = len(clasificacion["imagenes"])
+    n_fotos = len(FOTOS_INFORME)
     mensaje_spinner = "Armando el reporte..."
     if n_fotos > 10:
         mensaje_spinner = f"Armando el reporte y optimizando {n_fotos} fotos para no superar {LIMITE_REPORTE_BYTES // MB} MB..."
     with st.spinner(mensaje_spinner):
         try:
-            excel_bytes, _, n_insertadas, info_peso = generar_reporte(valores, clasificacion["imagenes"], EDICIONES)
+            excel_bytes, _, n_insertadas, info_peso = generar_reporte(valores, FOTOS_INFORME, EDICIONES)
         except Exception as e:
             st.error(f"No se pudo generar el reporte: {e}")
             logger.error(f"Error generando el reporte: {e}")
@@ -1566,12 +1692,13 @@ if generar:
         )
         st.dataframe(df_preview, use_container_width=True, hide_index=True)
 
-        if clasificacion["imagenes"]:
-            n_editadas = sum(1 for a in clasificacion["imagenes"] if EDICIONES.get(clave_foto(a)))
-            st.caption(f"🖼️ Fotos insertadas: {n_insertadas}/{len(clasificacion['imagenes'])}"
+        if FOTOS_INFORME:
+            n_editadas = sum(1 for a in FOTOS_INFORME if EDICIONES.get(clave_foto(a)))
+            st.caption(f"🖼️ Fotos insertadas: {n_insertadas}/{len(FOTOS_INFORME)}"
+                       + (f" · {len(FOTOS_FUERA)} dejadas fuera" if FOTOS_FUERA else "")
                        + (f" · {n_editadas} con rotación/recorte aplicado" if n_editadas else ""))
         else:
-            st.info("No se adjuntaron fotos; el reporte queda sin imágenes insertadas.")
+            st.info("El reporte queda sin imágenes insertadas.")
 
         st.markdown("#### ⬇️ Descargar reporte final")
         st.download_button(
