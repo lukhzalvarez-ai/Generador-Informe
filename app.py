@@ -696,16 +696,18 @@ CUSTOM_CSS = """
 :root {
     --astara-navy: #002060;
     --astara-navy-dark: #001640;
-    --astara-navy-soft: #E8EDF7;
+    --astara-bg: #0D1A36;
+    --astara-surface: #142449;
+    --astara-border: #2A3F70;
     --astara-gold: #FFC000;
     --astara-gold-dark: #D9A300;
-    --astara-text: #0F1B33;
+    --astara-text: #E6ECF7;
 }
 
-/* Fondo general claro, con una franja azul institucional arriba */
+/* Fondo general oscuro (azul noche), con una franja azul institucional arriba */
 .stApp {
     background:
-        linear-gradient(180deg, var(--astara-navy) 0px, var(--astara-navy) 230px, #F3F5FA 230px, #F3F5FA 100%);
+        linear-gradient(180deg, var(--astara-navy) 0px, var(--astara-navy) 230px, var(--astara-bg) 230px, var(--astara-bg) 100%);
     color: var(--astara-text);
 }
 [data-testid="stHeader"] { background: transparent; }
@@ -753,9 +755,9 @@ CUSTOM_CSS = """
 /* Etiquetas de archivos detectados */
 .astara-badge {
     display: inline-block;
-    background: #FFFFFF;
-    color: var(--astara-navy) !important;
-    border: 1.5px solid var(--astara-navy);
+    background: var(--astara-surface);
+    color: var(--astara-text) !important;
+    border: 1.5px solid var(--astara-border);
     border-radius: 999px;
     padding: 3px 12px;
     font-size: 0.8rem;
@@ -763,23 +765,26 @@ CUSTOM_CSS = """
     margin-right: 6px;
     margin-bottom: 6px;
 }
-.astara-badge.ok { background: var(--astara-navy); color: #FFFFFF !important; }
-.astara-badge.warn { background: #FFF4D1; border-color: var(--astara-gold-dark); color: #7A5600 !important; }
-.astara-badge.missing { background: #F1F1F1; border-color: #9CA3AF; color: #6B7280 !important; }
+.astara-badge.ok { background: var(--astara-navy); border-color: #4C6FB8; color: #FFFFFF !important; }
+.astara-badge.warn { background: rgba(255, 192, 0, 0.10); border-color: var(--astara-gold); color: var(--astara-gold) !important; }
+.astara-badge.missing { background: transparent; border-color: #4B5563; color: #9CA3AF !important; }
 
 /* Títulos de sección con acento amarillo */
 .stApp h4 {
-    color: var(--astara-navy) !important;
+    color: #FFFFFF !important;
     border-left: 5px solid var(--astara-gold);
     padding-left: 0.6rem;
 }
 
+/* Textos secundarios (captions) un poco más tenues */
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color: #A9B6D3 !important; }
+
 /* Zona de carga */
 div[data-testid="stFileUploaderDropzone"] {
-    border: 2px dashed var(--astara-navy) !important;
-    background: #FFFFFF !important;
+    border: 2px dashed var(--astara-gold) !important;
+    background: var(--astara-surface) !important;
 }
-div[data-testid="stFileUploaderDropzone"] * { color: var(--astara-navy) !important; }
+div[data-testid="stFileUploaderDropzone"] * { color: var(--astara-text) !important; }
 
 /* Botones primarios: amarillo con texto azul */
 .stButton > button[kind="primary"],
@@ -797,7 +802,7 @@ button[data-testid="stBaseButton-primary"] * { color: var(--astara-navy) !import
 .stDownloadButton > button[kind="primary"]:hover,
 button[data-testid="stBaseButton-primary"]:hover {
     background: var(--astara-navy) !important;
-    border-color: var(--astara-navy) !important;
+    border-color: var(--astara-gold) !important;
 }
 .stButton > button[kind="primary"]:hover *,
 .stDownloadButton > button[kind="primary"]:hover *,
@@ -805,13 +810,13 @@ button[data-testid="stBaseButton-primary"]:hover * { color: var(--astara-gold) !
 
 /* Indicadores de peso */
 [data-testid="stMetric"] {
-    background: #FFFFFF;
-    border: 1px solid #D6DCEA;
-    border-top: 4px solid var(--astara-navy);
+    background: var(--astara-surface);
+    border: 1px solid var(--astara-border);
+    border-top: 4px solid var(--astara-gold);
     border-radius: 10px;
     padding: 0.7rem 1rem;
 }
-[data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color: var(--astara-navy) !important; }
+[data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color: var(--astara-gold) !important; }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
