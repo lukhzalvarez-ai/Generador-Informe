@@ -701,28 +701,8 @@ def _peso_base_excel(plantilla_bytes: bytes, valores: dict) -> int:
     return len(excel)
 
 
-def detectar_reingreso(texto_ot: str):
-    """Lee el campo 'Trabajo repetido' de la Orden de Trabajo.
-    Devuelve True (Sí), False (No) o None (no se encontró)."""
-    if not texto_ot:
-        return None
-    m = re.search(r"Trabajo\s+repetido\s*\n?\s*(S[íi]|No)\b", texto_ot, re.IGNORECASE)
-    if not m:
-        return None
-    return m.group(1).lower().startswith("s")
-
-
-def componer_queja(queja: str, es_reingreso: bool) -> str:
-    """Texto final de C12: la queja + la respuesta explícita sobre reingreso
-    que pide la pregunta 1 del formulario."""
-    linea = "Reingreso (menos de 6 meses): " + ("SÍ" if es_reingreso else "NO")
-    queja = (queja or "").strip()
-    return f"{queja}\n{linea}" if queja else linea
-
-
 def extraer_valores(clasificacion: dict) -> dict:
-    """Lee los PDF y devuelve los valores sugeridos para cada celda, más la
-    clave especial 'es_reingreso' (True/False/None)."""
+    """Lee los PDF y devuelve los valores sugeridos para cada celda."""
     datos_ot = extraer_datos_pdf(clasificacion["pdf_orden"] or "")
     datos_garantias = extraer_datos_from_garantias_pdf(clasificacion["pdf_garantias"] or "")
 
@@ -739,7 +719,6 @@ def extraer_valores(clasificacion: dict) -> dict:
         "diagnostico_tecnico": datos_garantias.get("diagnostico_tecnico_garantias", ""),
         "repuestos_usados": datos_garantias.get("repuestos_usados_garantias", ""),
     }
-    valores["es_reingreso"] = detectar_reingreso(clasificacion["pdf_orden"] or "")
     return valores
 
 
@@ -1047,7 +1026,6 @@ def cargar_en_formulario(vals: dict) -> None:
     """Rellena los campos del formulario con lo leído de los PDF."""
     for campo in CELDAS_EXCEL:
         st.session_state[f"campo_{campo}"] = vals.get(campo, "") or ""
-    st.session_state["campo_reingreso"] = "Sí" if vals.get("es_reingreso") else "No"
 
 
 # Solo se recargan los campos cuando cambian los PDF; así lo que el usuario
@@ -1074,15 +1052,6 @@ with st.form("form_reporte", border=True):
         key="campo_queja_cliente", height=110,
         placeholder="Ej.: Cliente ingresa con el motor bloqueado, este no gira.",
     )
-    if valores_pdf.get("es_reingreso") is None:
-        ayuda_reingreso = "No se encontró el campo 'Trabajo repetido' en la Orden de Trabajo; indícalo manualmente."
-    else:
-        ayuda_reingreso = (
-            "Pre-marcado según el campo 'Trabajo repetido' de la Orden de Trabajo "
-            f"({'Sí' if valores_pdf['es_reingreso'] else 'No'})."
-        )
-    st.radio("¿Es reingreso (menos de 6 meses)?", ["No", "Sí"], key="campo_reingreso",
-             horizontal=True, help=ayuda_reingreso)
 
     st.text_area(
         "2) ¿Cuál es el resultado de su investigación? (Diagnóstico técnico)",
@@ -1107,8 +1076,6 @@ with st.form("form_reporte", border=True):
 if generar:
     valores = {campo: (st.session_state.get(f"campo_{campo}", "") or "").strip() for campo in CELDAS_EXCEL}
     faltantes = validar_campos_criticos(valores)
-    valores["queja_cliente"] = componer_queja(valores["queja_cliente"],
-                                              st.session_state.get("campo_reingreso") == "Sí")
 
     n_fotos = len(clasificacion["imagenes"])
     mensaje_spinner = "Armando el reporte..."
