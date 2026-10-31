@@ -1110,19 +1110,106 @@ def restablecer_foto(clave: str) -> None:
     cerrar_recorte()
 
 
+def _editor_recorte(archivo) -> None:
+    """Contenido del editor de recorte de UNA foto. Se muestra dentro de una
+    ventana emergente (st.dialog) para que aparezca a la vista sin importar
+    dónde esté la foto en la página."""
+    clave = clave_foto(archivo)
+    ed = _edicion_de(clave)
+    st.markdown(f"**{archivo.name}**")
+    libre = st.checkbox(
+        "Proporción libre", value=False, key=f"libre_{clave}",
+        help="Por defecto el recorte usa la forma del recuadro de la foto en el informe, "
+             "así la foto no se ve estirada ni aplastada.",
+    )
+    # Imagen base: rotada pero SIN recortar, de máx. 600 px para que el
+    # recortador no la reescale (las coordenadas quedan en sus píxeles).
+    base = _abrir_normalizada(archivo.getvalue(), 600, {"rot": ed.get("rot", 0)})
+    w, h = base.size
+    nuevo_crop = None
+    usar_deslizadores = not CROPPER_DISPONIBLE
+    if CROPPER_DISPONIBLE:
+        st.caption("Arrastra y ajusta el recuadro amarillo sobre la zona que quieres conservar.")
+        try:
+            caja = st_cropper(
+                base, realtime_update=True, box_color="#FFC000",
+                aspect_ratio=None if libre else PROPORCION_RECUADRO,
+                return_type="box", key=f"cropper_{clave}_{libre}",
+            )
+            izq, arr = caja["left"] / w, caja["top"] / h
+            nuevo_crop = (izq, arr, izq + caja["width"] / w, arr + caja["height"] / h)
+        except Exception as e:  # si el componente falla, se usa el plan B
+            logger.error(f"Recortador interactivo no disponible: {e}")
+            usar_deslizadores = True
+    if usar_deslizadores:
+        st.caption("Ajusta cuánto recortar de cada borde (en %).")
+        c1, c2 = st.columns(2)
+        m_izq = c1.slider("Recortar a la izquierda", 0, 90, 0, key=f"mi_{clave}")
+        m_der = c1.slider("Recortar a la derecha", 0, 90, 0, key=f"md_{clave}")
+        m_arr = c2.slider("Recortar arriba", 0, 90, 0, key=f"ma_{clave}")
+        m_aba = c2.slider("Recortar abajo", 0, 90, 0, key=f"mb_{clave}")
+        if m_izq + m_der < 95 and m_arr + m_aba < 95:
+            nuevo_crop = (m_izq / 100, m_arr / 100, 1 - m_der / 100, 1 - m_aba / 100)
+        else:
+            st.warning("El recorte deja la foto vacía; reduce los márgenes.")
+
+    if nuevo_crop:
+        st.caption("Vista previa del resultado:")
+        st.image(aplicar_edicion(base, {"crop": nuevo_crop}), width=360)
+
+    a1, a2, a3 = st.columns(3)
+    if a1.button("✅ Aplicar recorte", type="primary", use_container_width=True,
+                 disabled=nuevo_crop is None, key=f"aplicar_{clave}"):
+        guardar_recorte(clave, nuevo_crop)
+        st.rerun()
+    if a2.button("↩️ Deshacer cambios", use_container_width=True, key=f"deshacer_{clave}",
+                 help="Quita la rotación y el recorte de esta foto"):
+        restablecer_foto(clave)
+        st.rerun()
+    if a3.button("Cancelar", use_container_width=True, key=f"cancelar_{clave}"):
+        cerrar_recorte()
+        st.rerun()
+
+
+# Ventana emergente si la versión de Streamlit la tiene (1.34+); si no, el
+# editor se muestra arriba de las fotos.
+_dialogo_api = getattr(st, "dialog", None) or getattr(st, "experimental_dialog", None)
+if _dialogo_api is not None:
+    try:
+        _dialogo_recorte = _dialogo_api("✂️ Recortar foto", width="large")(_editor_recorte)
+    except TypeError:
+        _dialogo_recorte = _dialogo_api("✂️ Recortar foto")(_editor_recorte)
+else:
+    _dialogo_recorte = None
+
+
 if clasificacion["imagenes"]:
     st.markdown("#### 🖼️ Fotos del informe")
     st.caption(
         "Así quedarán en el informe y en este orden. ⭐ = alta calidad. "
         "Usa ↺ ↻ para rotar y ✂️ para recortar; los cambios se aplican al generar el informe."
     )
+
+    # ---- Editor de recorte (una foto a la vez) ----
+    clave_abierta = st.session_state.get("foto_en_recorte")
+    archivo_en_recorte = next(
+        (a for a in clasificacion["imagenes"] if clave_foto(a) == clave_abierta), None
+    )
+    if archivo_en_recorte is not None:
+        if _dialogo_recorte is not None:
+            # La ventana se mantiene abierta sola mientras se usa; se limpia la
+            # marca para que no reaparezca si el usuario la cierra con la X.
+            st.session_state.pop("foto_en_recorte", None)
+            _dialogo_recorte(archivo_en_recorte)
+        else:
+            with st.container(border=True):
+                st.markdown("##### ✂️ Recortar foto")
+                _editor_recorte(archivo_en_recorte)
+
     columnas = st.columns(4)
-    archivo_en_recorte = None
     for i, archivo in enumerate(clasificacion["imagenes"]):
         clave = clave_foto(archivo)
         ed = _edicion_de(clave)
-        if st.session_state.get("foto_en_recorte") == clave:
-            archivo_en_recorte = archivo
         marcas = []
         if ed.get("rot"):
             marcas.append(f"rotada {ed['rot']}°")
@@ -1144,59 +1231,6 @@ if clasificacion["imagenes"]:
                       help="Rotar 90° a la derecha", use_container_width=True)
             b3.button("✂️", key=f"recortar_{i}", on_click=abrir_recorte, args=(clave,),
                       help="Recortar", use_container_width=True)
-
-    # ---- Editor de recorte (una foto a la vez) ----
-    if archivo_en_recorte is not None:
-        clave = clave_foto(archivo_en_recorte)
-        ed = _edicion_de(clave)
-        with st.container(border=True):
-            st.markdown(f"##### ✂️ Recortar: {archivo_en_recorte.name}")
-            libre = st.checkbox(
-                "Proporción libre", value=False, key=f"libre_{clave}",
-                help="Por defecto el recorte usa la forma del recuadro de la foto en el informe, "
-                     "así la foto no se ve estirada ni aplastada.",
-            )
-            # Imagen base: rotada pero SIN recortar, de máx. 600 px para que el
-            # recortador no la reescale (las coordenadas quedan en sus píxeles).
-            base = _abrir_normalizada(archivo_en_recorte.getvalue(), 600, {"rot": ed.get("rot", 0)})
-            w, h = base.size
-            nuevo_crop = None
-            usar_deslizadores = not CROPPER_DISPONIBLE
-            if CROPPER_DISPONIBLE:
-                st.caption("Arrastra y ajusta el recuadro amarillo sobre la zona que quieres conservar.")
-                try:
-                    caja = st_cropper(
-                        base, realtime_update=True, box_color="#FFC000",
-                        aspect_ratio=None if libre else PROPORCION_RECUADRO,
-                        return_type="box", key=f"cropper_{clave}_{libre}",
-                    )
-                    izq, arr = caja["left"] / w, caja["top"] / h
-                    nuevo_crop = (izq, arr, izq + caja["width"] / w, arr + caja["height"] / h)
-                except Exception as e:  # si el componente falla, se usa el plan B
-                    logger.error(f"Recortador interactivo no disponible: {e}")
-                    usar_deslizadores = True
-            if usar_deslizadores:
-                st.caption("Ajusta cuánto recortar de cada borde (en %).")
-                c1, c2 = st.columns(2)
-                m_izq = c1.slider("Recortar a la izquierda", 0, 90, 0, key=f"mi_{clave}")
-                m_der = c1.slider("Recortar a la derecha", 0, 90, 0, key=f"md_{clave}")
-                m_arr = c2.slider("Recortar arriba", 0, 90, 0, key=f"ma_{clave}")
-                m_aba = c2.slider("Recortar abajo", 0, 90, 0, key=f"mb_{clave}")
-                if m_izq + m_der < 95 and m_arr + m_aba < 95:
-                    nuevo_crop = (m_izq / 100, m_arr / 100, 1 - m_der / 100, 1 - m_aba / 100)
-                else:
-                    st.warning("El recorte deja la foto vacía; reduce los márgenes.")
-
-            if nuevo_crop:
-                st.caption("Vista previa del resultado:")
-                st.image(aplicar_edicion(base, {"crop": nuevo_crop}), width=360)
-
-            a1, a2, a3 = st.columns(3)
-            a1.button("✅ Aplicar recorte", type="primary", use_container_width=True,
-                      on_click=guardar_recorte, args=(clave, nuevo_crop), disabled=nuevo_crop is None)
-            a2.button("↩️ Deshacer cambios de esta foto", use_container_width=True,
-                      on_click=restablecer_foto, args=(clave,))
-            a3.button("Cerrar", use_container_width=True, on_click=cerrar_recorte)
 
 # --------------------------------------------------------------------------
 # Paso 2: revisar / completar los textos antes de generar
