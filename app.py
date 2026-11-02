@@ -1,810 +1,100 @@
 """
-Reporte Técnico Astara — App Streamlit
-========================================
-Genera 'Reporte de falla Astara.xlsx' a partir de:
-  - Orden de Trabajo.pdf
-  - Trabajo en Garantías.pdf
-  - Plantilla 'Reporte Técnico Astara.xlsx'
-  - Imágenes de respaldo
+Reporte Técnico Astara — App Streamlit (interfaz)
+==================================================
+Genera 'Reporte de falla Astara.xlsx' a partir de la Orden de Trabajo, el
+Trabajo en Garantías y las fotos, todo subido en un solo campo.
 
-Todo se sube en UN SOLO campo de carga de archivos; la app detecta
-automáticamente qué es cada documento (por nombre y, si hace falta,
-por contenido).
+Estructura del proyecto:
+  app.py                 ← esta pantalla (Streamlit): carga, fotos, formulario, descarga
+  reporte/config.py      ← constantes: celdas, mapas, límites de peso, formatos
+  reporte/pdf.py         ← lectura de los PDF y valores sugeridos
+  reporte/archivos.py    ← clasificación de archivos subidos e identificadores
+  reporte/imagenes.py    ← rotar/recortar/comprimir fotos (máx. 25 MB)
+  reporte/excel.py       ← armado del Excel desde la plantilla
+  reporte/componentes.py ← recortador y ordenador de fotos (HTML propio)
 
-La lógica de extracción de datos es la misma del script original
-(regex, mapeos de concesionarios, reglas de filtrado del PDF de
-Garantías, etc.). Lo único que cambia es el manejo de archivos:
-en vez de rutas fijas en disco, se trabaja en memoria (BytesIO)
-para que la app funcione igual en local (.bat) o en Streamlit
-Community Cloud (GitHub).
-
-Control de peso del reporte (v2)
---------------------------------
-El Excel final nunca supera los 25 MB, sin importar cuántas fotos se
-adjunten (hasta ~25 o más):
-  - Las 2 PRIMERAS fotos se guardan siempre con alta calidad.
-  - Las demás se guardan con la misma calidad mientras el total quepa
-    en el límite; solo si no cabe, se comprimen por niveles (resolución
-    y calidad JPEG) hasta que el reporte quede bajo el límite.
-  - Únicamente en un caso extremo (que ni con las secundarias al mínimo
-    quepa) se reducen también las 2 primeras.
-  - Al final se verifica el tamaño REAL del .xlsx guardado.
+Rendimiento: lo costoso (leer PDF, miniaturas) se guarda en caché usando una
+"huella" rápida de cada archivo, así cada clic no vuelve a procesar los
+megas de todas las fotos.
 """
 
 import io
-import re
 import base64
-import logging
-import tempfile
-import unicodedata
-from pathlib import Path
 
 import streamlit as st
 import pandas as pd
-import openpyxl
-from openpyxl.cell.cell import MergedCell
-from openpyxl.drawing.image import Image as XLImage
-from PIL import Image as PILImage, ImageOps, ImageDraw
 
-# Soporte opcional para fotos de iPhone (HEIC/HEIF). Requiere 'pillow-heif'
-# en requirements.txt; si no está instalado, esas fotos simplemente se ignoran.
-try:
-    from pillow_heif import register_heif_opener
-    register_heif_opener()
-    HEIF_DISPONIBLE = True
-except ImportError:
-    HEIF_DISPONIBLE = False
-
-try:
-    import pypdf
-    PDF_LIBRARY_AVAILABLE = True
-except ImportError:
-    try:
-        import PyPDF2 as pypdf
-        PDF_LIBRARY_AVAILABLE = True
-    except ImportError:
-        PDF_LIBRARY_AVAILABLE = False
-
-# Evita el aviso de "decompression bomb" con fotos de cámaras de alta resolución
-PILImage.MAX_IMAGE_PIXELS = 200_000_000
-
-# --------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("reporte_astara")
-
-# --------------------------------------------------------------------------
-# Constantes (idénticas al script original)
-# --------------------------------------------------------------------------
-CM_TO_PX_96DPI = 37.7952
-TARGET_WIDTH = int(13.19 * CM_TO_PX_96DPI)
-TARGET_HEIGHT = int(5.69 * CM_TO_PX_96DPI)
-
-IMG_START_ROW = 28
-IMG_ROW_INCREMENT = 11
-IMG_COLUMNS = ("C", "G")
-
-# --------------------------------------------------------------------------
-# Control de peso del reporte
-# --------------------------------------------------------------------------
-MB = 1024 * 1024
-LIMITE_REPORTE_BYTES = 25 * MB          # límite duro solicitado
-OBJETIVO_REPORTE_BYTES = int(24.0 * MB)  # se apunta un poco más abajo como margen de seguridad
-N_FOTOS_PRIORITARIAS = 2                 # las 2 primeras fotos priorizan calidad
-
-# (lado máximo en px, calidad JPEG). El nivel 0 equivale a la calidad
-# original de la app (resolución completa, calidad 88).
-NIVELES_PRIORITARIAS = [
-    (4096, 92),
-    (3200, 90),
-    (2560, 88),
-    (2048, 85),
-]
-NIVELES_SECUNDARIAS = [
-    (4096, 88),   # sin ahorro: igual que antes
-    (3000, 85),
-    (2400, 83),
-    (2000, 80),
-    (1600, 78),
-    (1366, 75),
-    (1152, 72),
-    (1024, 68),
-    (900, 64),
-    (800, 60),
-]
-
-CELDAS_EXCEL = {
-    "vin": "G5",
-    "fecha_falla": "D7",
-    "fecha_cierre_ot": "G7",
-    "km": "I7",
-    "concesionario": "D9",
-    "asesor_responsable": "G9",
-    "tecnico": "I9",
-    "queja_cliente": "C12",
-    "diagnostico_tecnico": "C16",
-    "repuestos_usados": "C20",
-    "trabajo_realizado": "C24",
-}
-
-CAMPOS_CRITICOS = (
-    "vin",
-    "fecha_falla",
-    "fecha_cierre_ot",
-    "queja_cliente",
-    "diagnostico_tecnico",
+from reporte.config import (
+    logger, MB, LIMITE_REPORTE_BYTES, N_FOTOS_PRIORITARIAS, CELDAS_EXCEL, ETIQUETAS_CAMPOS,
+    EXTENSIONES_IMAGEN, TEMPLATE_FILENAME, PROPORCION_RECUADRO,
 )
-
-ETIQUETAS_CAMPOS = {
-    "vin": "VIN",
-    "fecha_falla": "Fecha de falla",
-    "fecha_cierre_ot": "Fecha cierre OT",
-    "km": "Kilometraje",
-    "concesionario": "Concesionario",
-    "asesor_responsable": "Asesor responsable",
-    "tecnico": "Técnico",
-    "queja_cliente": "Queja del cliente",
-    "diagnostico_tecnico": "Diagnóstico técnico",
-    "repuestos_usados": "Repuestos usados",
-    "trabajo_realizado": "Trabajo realizado",
-}
-
-MAPA_CONCESIONARIOS = {
-    "OTA": "ASTARA RETAIL ALAMEDA",
-    "OTE": "ASTARA RETAIL EL CORTIJO",
-    "OTC": "ASTARA RETAIL CANTAGALLO",
-    "OTN": "ASTARA RETAIL NOS",
-    "OTG": "ASTARA RETAIL LA DEHESA",
-    "OTM": "ASTARA RETAIL MACHALÍ",
-}
-
-ETIQUETAS_BLOQUE_DIAGNOSTICO = {
-    "cód. avería",
-    "tipo garantía",
-    "% deferencia mo",
-    "gf",
-    "kmts",
-}
-
-# Formatos de foto aceptados. HEIC/HEIF (iPhone) solo si 'pillow-heif'
-# está instalado.
-EXTENSIONES_IMAGEN = {"jpg", "jpeg", "jfif", "png", "webp", "bmp", "gif", "tif", "tiff"}
-if HEIF_DISPONIBLE:
-    EXTENSIONES_IMAGEN |= {"heic", "heif"}
-
-# Nombres EXACTOS (sin importar mayúsculas, tildes, guiones/guiones bajos ni
-# copias tipo "(1)") que debe tener cada PDF para ser reconocido.
-NOMBRE_PDF_ORDEN = "orden de trabajo"
-NOMBRES_PDF_GARANTIAS = {"trabajo en garantias", "trabajo en garantia"}
-
-# Plantilla: siempre la incluida en el repositorio, junto a este archivo.
-TEMPLATE_FILENAME = "Reporte_de_falla_Astara.xlsx"
-TEMPLATE_PATH = Path(__file__).resolve().parent / TEMPLATE_FILENAME
-
-
-def cargar_plantilla_predeterminada() -> bytes:
-    """Devuelve los bytes de la plantilla incluida en el repositorio,
-    o None si no está presente."""
-    if not TEMPLATE_PATH.exists():
-        return None
-    try:
-        return TEMPLATE_PATH.read_bytes()
-    except Exception as e:
-        logger.error(f"No se pudo leer la plantilla predeterminada: {e}")
-        return None
+from reporte.pdf import extraer_texto_pdf, extraer_valores, validar_campos_criticos
+from reporte.archivos import (
+    clasificar_archivos_subidos, clave_foto, huella, _es_imagen_valida,
+)
+from reporte.imagenes import (
+    abrir_normalizada, aplicar_edicion, calcular_celda_imagen, calcular_encuadre, dibujar_marco,
+)
+from reporte.excel import cargar_plantilla_predeterminada, generar_reporte
+from reporte.componentes import recortador as componente_recortador, ordenador as componente_ordenador
 
 
 # --------------------------------------------------------------------------
-# Extracción de texto de PDF (centralizada, trabaja sobre bytes en memoria)
+# Caché: cada archivo se identifica por su huella (nombre + tamaño + muestra
+# de su contenido). Los bytes van en parámetros con "_" para que Streamlit
+# NO los recorra completos al buscar en la caché.
 # --------------------------------------------------------------------------
-def extraer_texto_pdf(file_bytes: bytes, nombre: str = "") -> str:
-    """Extrae y concatena el texto de todas las páginas de un PDF en memoria."""
-    if not PDF_LIBRARY_AVAILABLE:
-        logger.warning("No hay librería de PDF disponible (pypdf/PyPDF2).")
-        return ""
-    if not file_bytes:
-        logger.warning(f"Archivo PDF vacío: {nombre}")
-        return ""
-    try:
-        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-    except Exception as e:
-        logger.error(f"Error leyendo el PDF '{nombre}': {e}")
-        return ""
+@st.cache_data(show_spinner=False, max_entries=50)
+def _texto_pdf(huella_archivo: str, _datos: bytes, nombre: str) -> str:
+    return extraer_texto_pdf(_datos, nombre)
 
 
-# --------------------------------------------------------------------------
-# Extracción de datos — Orden de Trabajo
-# --------------------------------------------------------------------------
-def extraer_datos_pdf(texto_completo: str) -> dict:
-    datos = {
-        "vin": "", "fecha_falla": "", "fecha_cierre_ot": "", "km": "",
-        "concesionario": "", "asesor_responsable": "", "tecnico": "",
-        "queja_cliente": "", "diagnostico_tecnico": "", "trabajo_realizado": "",
-    }
-    if not texto_completo:
-        return datos
-
-    try:
-        vin_match = re.search(r"VIN\s*[:]?\s*([A-HJ-NPR-Z0-9]{17})", texto_completo, re.IGNORECASE | re.DOTALL)
-        if vin_match:
-            datos["vin"] = vin_match.group(1)
-        else:
-            logger.warning("No se pudo extraer el VIN del PDF de Orden de Trabajo.")
-
-        f_apertura_match = re.search(r"Fecha\s+apertura\s+([0-9]{2}-[0-9]{2}-[0-9]{4})", texto_completo, re.IGNORECASE | re.DOTALL)
-        if f_apertura_match:
-            datos["fecha_falla"] = f_apertura_match.group(1)
-        else:
-            logger.warning("No se pudo extraer la fecha de apertura/falla.")
-
-        f_cierre_match = re.search(r"F\.\s*Impresi[oó]n\s+([0-9]{2}-[0-9]{2}-[0-9]{2,4})", texto_completo, re.IGNORECASE | re.DOTALL)
-        if f_cierre_match:
-            f_str = f_cierre_match.group(1)
-            if len(f_str.split("-")[-1]) == 2:
-                partes = f_str.split("-")
-                f_str = f"{partes[0]}-{partes[1]}-20{partes[2]}"
-            datos["fecha_cierre_ot"] = f_str
-        else:
-            logger.warning("No se pudo extraer la fecha de cierre de la OT.")
-
-        km_match = re.search(r"Kilómetros\s+([\d\.]+)", texto_completo, re.IGNORECASE | re.DOTALL)
-        if km_match:
-            datos["km"] = km_match.group(1)
-
-        ot_match = re.search(r"Nº\s*O\.?T\.?\s*([A-Z]{3})(?:/[0-9]+/[0-9]{4})?", texto_completo, re.IGNORECASE | re.DOTALL)
-        if ot_match:
-            prefix = ot_match.group(1).upper()
-            if prefix in MAPA_CONCESIONARIOS:
-                datos["concesionario"] = MAPA_CONCESIONARIOS[prefix]
-            else:
-                logger.warning(f"Prefijo de OT '{prefix}' no está en el mapa de concesionarios.")
-
-        asesor_regex = (
-            r"VEHÍCULO\s*\n\s*([^\n]+?)(?:\s*\([\d\s-]+\)|\s*Tel[\.\s:]|"
-            r"\s*E-mail|\s*Fax|\s*Móvil|\s*\d{9,})"
-        )
-        asesor_match = re.search(asesor_regex, texto_completo, re.DOTALL)
-        if asesor_match:
-            datos["asesor_responsable"] = _normalizar_espacios(asesor_match.group(1))
-        else:
-            asesor_match_fb = re.search(r"VEHÍCULO\s+([A-Za-z\s]+?)(?:\s*\(|\s*-)", texto_completo, re.DOTALL)
-            if asesor_match_fb:
-                datos["asesor_responsable"] = _normalizar_espacios(asesor_match_fb.group(1))
-
-        tecnico_match = re.search(r"Técnico\s*:\s*(.*?)(?:\n|\r|$)", texto_completo, re.IGNORECASE | re.DOTALL)
-        if tecnico_match:
-            datos["tecnico"] = tecnico_match.group(1).strip()
-
-        queja_regex = (
-            r"(?:Taller Mecanica|QUEJA CLIENTE|Denominaci[oó]n de Falla)\s*\n*(.*?)"
-            r"(?=\n{2,}|$|DIAGNÓSTICO TÉCNICO|TRABAJO REALIZADO|REPUESTOS|MEDIDAS)"
-        )
-        queja_match = re.search(queja_regex, texto_completo, re.IGNORECASE | re.DOTALL)
-        if queja_match:
-            datos["queja_cliente"] = queja_match.group(1).strip()
-
-        diagnostico_match = re.search(
-            r"DIAGNÓSTICO TÉCNICO\s*\n*(.*?)(?=\n{2,}|$|TRABAJO REALIZADO|REPUESTOS|MEDIDAS)",
-            texto_completo, re.IGNORECASE | re.DOTALL,
-        )
-        if diagnostico_match:
-            datos["diagnostico_tecnico"] = diagnostico_match.group(1).strip()
-
-        trabajo_match = re.search(r"TRABAJO REALIZADO\s*\n*(.*?)(?=\n{2,}|$|REPUESTOS|MEDIDAS)", texto_completo, re.IGNORECASE | re.DOTALL)
-        if trabajo_match:
-            datos["trabajo_realizado"] = trabajo_match.group(1).strip()
-
-    except Exception as e:
-        logger.error(f"Error inesperado al parsear Orden de Trabajo: {e}")
-
-    return datos
+def leer_pdf_cache(archivo) -> str:
+    return _texto_pdf(huella(archivo), archivo.getvalue(), archivo.name)
 
 
-# --------------------------------------------------------------------------
-# Extracción de datos — Trabajo en Garantías
-# --------------------------------------------------------------------------
-def _normalizar_espacios(texto: str) -> str:
-    return re.sub(r"\s+", " ", texto).strip()
+@st.cache_data(show_spinner=False, max_entries=500)
+def _imagen_valida(huella_archivo: str, _datos: bytes) -> bool:
+    return _es_imagen_valida(_datos)
 
 
-def _es_linea_numerica(linea: str) -> bool:
-    return bool(re.fullmatch(r"[\d.,\s]+", linea))
+def imagen_valida_cache(archivo) -> bool:
+    return _imagen_valida(huella(archivo), archivo.getvalue())
 
 
-def extraer_datos_from_garantias_pdf(texto_completo: str) -> dict:
-    datos_garantias = {
-        "queja_cliente_garantias": "",
-        "diagnostico_tecnico_garantias": "",
-        "repuestos_usados_garantias": "",
-    }
-    if not texto_completo:
-        return datos_garantias
-
-    try:
-        queja_match = re.search(r"F\.\s*Cierre\s*(.*?)\s*\d+\s*Núm\.", texto_completo, re.DOTALL)
-        if queja_match:
-            datos_garantias["queja_cliente_garantias"] = _normalizar_espacios(queja_match.group(1))
-        else:
-            logger.warning("No se pudo extraer 'queja_cliente' del PDF de Garantías.")
-
-        block_match = re.search(r"Kmts\s*([\s\S]*?)Total", texto_completo, re.DOTALL)
-        if block_match:
-            lineas_utiles = []
-            for linea in block_match.group(1).splitlines():
-                linea = linea.strip()
-                if not linea:
-                    continue
-                if linea.lower() in ETIQUETAS_BLOQUE_DIAGNOSTICO:
-                    continue
-                if _es_linea_numerica(linea):
-                    continue
-                lineas_utiles.append(linea)
-            if lineas_utiles:
-                datos_garantias["diagnostico_tecnico_garantias"] = _normalizar_espacios(" ".join(lineas_utiles))
-            else:
-                logger.warning("Bloque de diagnóstico vacío tras filtrar etiquetas y números.")
-        else:
-            logger.warning("No se pudo extraer el bloque de diagnóstico técnico de Garantías.")
-
-        tabla_match = re.search(r"Referencia\s*\n\s*Tipo\s*([\s\S]*?)Fecha Reparación", texto_completo, re.DOTALL)
-        if tabla_match:
-            lineas_tabla = [l.strip() for l in tabla_match.group(1).split("\n")]
-            pares_repuestos = []
-            for i, linea in enumerate(lineas_tabla):
-                if linea.upper() != "MAT":
-                    continue
-                referencia = lineas_tabla[i - 1] if i - 1 >= 0 else ""
-                denominacion = lineas_tabla[i - 2] if i - 2 >= 0 else ""
-                if not referencia or not denominacion:
-                    logger.warning(f"Fila de repuesto incompleta cerca de la línea {i}; se omite.")
-                    continue
-                codigo = referencia.split("-", 1)[1].strip() if "-" in referencia else referencia
-                pares_repuestos.append(f"{codigo} - {denominacion}")
-            if pares_repuestos:
-                datos_garantias["repuestos_usados_garantias"] = "\n".join(pares_repuestos)
-            else:
-                logger.warning("No se encontraron filas de tipo 'MAT' (repuestos) en Garantías.")
-        else:
-            logger.warning("No se pudo extraer la tabla de repuestos de Garantías.")
-
-    except Exception as e:
-        logger.error(f"Error inesperado al parsear Trabajo en Garantías: {e}")
-
-    return datos_garantias
-
-
-def validar_campos_criticos(valores: dict) -> list:
-    """Devuelve la lista de campos críticos que quedaron vacíos."""
-    faltantes = [c for c in CAMPOS_CRITICOS if not valores.get(c)]
-    for campo in faltantes:
-        logger.warning(f"⚠ Campo crítico vacío tras la extracción: '{campo}'")
-    return faltantes
-
-
-# --------------------------------------------------------------------------
-# Clasificación automática de archivos subidos en el campo único
-# --------------------------------------------------------------------------
-def normalizar_nombre_archivo(nombre: str) -> str:
-    """Normaliza el nombre (sin extensión) para compararlo:
-    minúsculas, sin tildes, '_' '-' '.' como espacios, sin marcas de copia
-    del navegador/Windows como ' (1)' o ' - copia', y espacios colapsados.
-      'Trabajo_en_Garantías (2).pdf' -> 'trabajo en garantias'"""
-    base = nombre.rsplit(".", 1)[0] if "." in nombre else nombre
-    base = unicodedata.normalize("NFKD", base)
-    base = "".join(c for c in base if not unicodedata.combining(c)).lower()
-    base = re.sub(r"[_\-.]+", " ", base)
-    base = re.sub(r"\s*\(\d+\)\s*$", "", base)        # "(1)", "(2)"...
-    base = re.sub(r"\s+(copia|copy)(\s*\d+)?\s*$", "", base)  # "- copia", "copy 2"
-    return re.sub(r"\s+", " ", base).strip()
-
-
-def clasificar_pdf(nombre: str) -> str:
-    """Devuelve 'orden', 'garantias' o 'ignorar' SOLO según el nombre.
-    Cualquier PDF con otro nombre se ignora (no se adivina por contenido)."""
-    clave = normalizar_nombre_archivo(nombre)
-    if clave == NOMBRE_PDF_ORDEN:
-        return "orden"
-    if clave in NOMBRES_PDF_GARANTIAS:
-        return "garantias"
-    return "ignorar"
-
-
-def _es_imagen_valida(datos: bytes) -> bool:
-    """Comprueba que el archivo realmente sea una imagen legible (lee solo
-    la cabecera, es rápido)."""
-    try:
-        with PILImage.open(io.BytesIO(datos)) as img:
-            img.verify()
-        return True
-    except Exception:
-        return False
-
-
-def clasificar_archivos_subidos(archivos_subidos: list) -> dict:
-    """Recibe la lista de UploadedFile del campo único (puede venir vacía)
-    y se queda SOLO con:
-      - el PDF llamado 'Orden de Trabajo'
-      - el PDF llamado 'Trabajo en Garantías'
-      - las fotos (jpg, jpeg, png, webp, heic, ...), sin repetir nombre
-    Todo lo demás (otros PDF, Excel, Word, etc.) se ignora y se informa.
-    Si se sube más de un PDF con el mismo nombre, se usa el primero."""
-    resultado = {
-        "pdf_orden": None,
-        "pdf_orden_nombre": "",
-        "pdf_garantias": None,
-        "pdf_garantias_nombre": "",
-        "imagenes": [],
-        "ignorados": [],
-    }
-    vistos_imagenes = set()
-
-    for archivo in archivos_subidos:
-        nombre = archivo.name
-        ext = nombre.lower().rsplit(".", 1)[-1] if "." in nombre else ""
-
-        if ext == "pdf":
-            tipo = clasificar_pdf(nombre)
-            if tipo == "orden" and resultado["pdf_orden"] is None:
-                resultado["pdf_orden"] = extraer_texto_pdf(archivo.getvalue(), nombre)
-                resultado["pdf_orden_nombre"] = nombre
-            elif tipo == "garantias" and resultado["pdf_garantias"] is None:
-                resultado["pdf_garantias"] = extraer_texto_pdf(archivo.getvalue(), nombre)
-                resultado["pdf_garantias_nombre"] = nombre
-            else:
-                resultado["ignorados"].append(nombre)
-            continue
-
-        if ext in EXTENSIONES_IMAGEN:
-            clave = nombre.lower()
-            if clave in vistos_imagenes or not _es_imagen_valida(archivo.getvalue()):
-                resultado["ignorados"].append(nombre)
-                continue
-            vistos_imagenes.add(clave)
-            resultado["imagenes"].append(archivo)
-            continue
-
-        resultado["ignorados"].append(nombre)
-
-    # Orden natural por nombre ("1", "2", ..., "10", "IMG_...", "WhatsApp..."):
-    # así el orden no depende de cómo el navegador entregue los archivos, y
-    # basta con nombrar "1" y "2" las fotos más importantes para que sean
-    # las prioritarias (alta calidad) y queden primeras en el reporte.
-    resultado["imagenes"].sort(key=lambda a: _clave_orden_natural(a.name))
-    return resultado
-
-
-def _clave_orden_natural(nombre: str) -> list:
-    """'foto 10.jpg' va después de 'foto 2.jpg' (no antes, como en orden
-    alfabético simple)."""
-    base = nombre.rsplit(".", 1)[0].lower()
-    return [(0, int(t), "") if t.isdigit() else (1, 0, t) for t in re.split(r"(\d+)", base) if t]
-
-
-# --------------------------------------------------------------------------
-# Imágenes — preparación y compresión adaptativa
-# --------------------------------------------------------------------------
-def calcular_celda_imagen(indice: int) -> str:
-    fila = IMG_START_ROW + (indice // len(IMG_COLUMNS)) * IMG_ROW_INCREMENT
-    columna = IMG_COLUMNS[indice % len(IMG_COLUMNS)]
-    return f"{columna}{fila}"
-
-
-def _abrir_normalizada(datos: bytes, lado_max: int, edicion: dict = None) -> PILImage.Image:
-    """Abre la imagen y aplica la misma transformación que el script
-    original (orientación EXIF, conversión a RGB, rotación si es vertical),
-    luego las ediciones del usuario (rotación y recorte, ver aplicar_edicion)
-    y la reduce a 'lado_max' px en su lado más largo si es más grande.
-
-    Se usa draft() para que, en JPEG, el decodificador lea directamente a
-    una escala menor cuando se va a reducir: ahorra mucha RAM y tiempo con
-    fotos de celular de 12-50 MP (importante en Streamlit Cloud)."""
-    img = PILImage.open(io.BytesIO(datos))
-    if img.format == "JPEG":
-        lado_decod = lado_max
-        recorte = (edicion or {}).get("crop")
-        if recorte:  # si se recorta, se decodifica más grande para no perder nitidez
-            fraccion = max(min(recorte[2] - recorte[0], recorte[3] - recorte[1]), 0.05)
-            lado_decod = int(lado_max / fraccion)
-        img.draft("RGB", (lado_decod, lado_decod))
-    img = ImageOps.exif_transpose(img)
-
-    # Transparencias (PNG con alfa) sobre fondo blanco; resto de modos a RGB.
-    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-        img = img.convert("RGBA")
-        fondo = PILImage.new("RGB", img.size, (255, 255, 255))
-        fondo.paste(img, mask=img.split()[-1])
-        img = fondo
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-
-    width, height = img.size
-    if height > width:
-        img = img.rotate(-90, expand=True)
-
-    img = aplicar_edicion(img, edicion)
-
-    if max(img.size) > lado_max:
-        img.thumbnail((lado_max, lado_max), PILImage.LANCZOS)
-    return img
-
-
-def aplicar_edicion(img: PILImage.Image, edicion: dict) -> PILImage.Image:
-    """Aplica la edición del usuario sobre la imagen ya normalizada:
-      - 'rot': grados en sentido horario (0, 90, 180, 270)
-      - 'crop': (izq, arriba, der, abajo) como FRACCIONES 0-1 de la imagen
-        ya rotada, así sirve igual para la miniatura y para la foto completa.
-    """
-    if not edicion:
-        return img
-    rot = edicion.get("rot", 0) % 360
-    if rot:
-        img = img.rotate(-rot, expand=True)
-    recorte = edicion.get("crop")
-    if recorte:
-        w, h = img.size
-        izq, arr, der, aba = (max(0.0, min(1.0, float(v))) for v in recorte)
-        caja = (int(izq * w), int(arr * h), int(der * w), int(aba * h))
-        if caja[2] - caja[0] >= 10 and caja[3] - caja[1] >= 10:
-            img = img.crop(caja)
-    return img
-
-
-def codificar_imagen(datos: bytes, lado_max: int, calidad: int, edicion: dict = None) -> bytes:
-    """Devuelve la imagen normalizada (y editada) como JPEG con el tamaño/calidad dados."""
-    img = _abrir_normalizada(datos, lado_max, edicion)
+@st.cache_data(show_spinner=False, max_entries=600)
+def _miniatura(huella_archivo: str, rot: int, crop, lado: int, _datos: bytes) -> bytes:
+    img = abrir_normalizada(_datos, lado, {"rot": rot, "crop": crop})
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=calidad, optimize=True, progressive=True)
-    img.close()
+    img.save(buffer, format="JPEG", quality=80)
     return buffer.getvalue()
 
 
-def comprimir_fotos_para_limite(fotos: list, presupuesto_bytes: int) -> tuple:
-    """Decide la compresión de cada foto para que la suma quepa en
-    'presupuesto_bytes'.
-
-    fotos: lista de (nombre, bytes_originales, edicion) en el orden del reporte.
-
-    Estrategia:
-      1. Las N_FOTOS_PRIORITARIAS primeras van en su mejor nivel.
-      2. El resto va en el nivel 0 (sin ahorro). Si el total no cabe,
-         se baja un nivel a TODAS las secundarias y se vuelve a probar,
-         hasta que quepa.
-      3. Solo si ni con las secundarias al mínimo cabe, se bajan también
-         las prioritarias, nivel a nivel.
-
-    Devuelve (lista_jpeg_bytes, info) con info = {'nivel_prioritarias',
-    'nivel_secundarias', 'total_bytes', 'cabe'}. Las fotos que fallen al
-    procesarse quedan como None.
-    """
-    n = len(fotos)
-    idx_prio = list(range(min(N_FOTOS_PRIORITARIAS, n)))
-    idx_sec = list(range(len(idx_prio), n))
-    resultado = [None] * n
-
-    def _codificar(indices, nivel_tabla, nivel):
-        lado, calidad = nivel_tabla[nivel]
-        for i in indices:
-            nombre, datos, edicion = fotos[i]
-            try:
-                resultado[i] = codificar_imagen(datos, lado, calidad, edicion)
-            except Exception as e:
-                logger.error(f"No se pudo procesar la imagen '{nombre}': {e}")
-                resultado[i] = None
-
-    def _total(indices):
-        return sum(len(resultado[i]) for i in indices if resultado[i])
-
-    nivel_p = 0
-    nivel_s = 0
-    _codificar(idx_prio, NIVELES_PRIORITARIAS, nivel_p)
-    _codificar(idx_sec, NIVELES_SECUNDARIAS, nivel_s)
-
-    while _total(range(n)) > presupuesto_bytes:
-        if idx_sec and nivel_s < len(NIVELES_SECUNDARIAS) - 1:
-            # Salto inteligente: estima cuánto hay que reducir para no
-            # recodificar nivel por nivel cuando el exceso es grande.
-            total_sec = _total(idx_sec)
-            disponible_sec = presupuesto_bytes - _total(idx_prio)
-            nivel_s += 1
-            if disponible_sec > 0 and total_sec > 2.5 * disponible_sec:
-                nivel_s = min(nivel_s + 1, len(NIVELES_SECUNDARIAS) - 1)
-            _codificar(idx_sec, NIVELES_SECUNDARIAS, nivel_s)
-        elif idx_prio and nivel_p < len(NIVELES_PRIORITARIAS) - 1:
-            nivel_p += 1
-            _codificar(idx_prio, NIVELES_PRIORITARIAS, nivel_p)
-        else:
-            break  # ya está todo al mínimo
-
-    total = _total(range(n))
-    info = {
-        "nivel_prioritarias": nivel_p,
-        "nivel_secundarias": nivel_s if idx_sec else None,
-        "total_bytes": total,
-        "cabe": total <= presupuesto_bytes,
-    }
-    logger.info(
-        f"Fotos: {n} | nivel prioritarias={nivel_p} | nivel secundarias={info['nivel_secundarias']} "
-        f"| total imágenes={total / MB:.2f} MB (presupuesto {presupuesto_bytes / MB:.2f} MB)"
-    )
-    return resultado, info
+def miniatura_jpeg(archivo, rot: int, crop, lado: int) -> bytes:
+    return _miniatura(huella(archivo), rot, tuple(crop) if crop else None, lado, archivo.getvalue())
 
 
-def insertar_imagenes(ws, imagenes_jpeg: list, nombres: list) -> int:
-    """Inserta las imágenes (ya comprimidas) en la hoja. Devuelve cuántas
-    se insertaron correctamente.
-
-    openpyxl necesita reabrir la imagen desde un buffer al guardar, por eso
-    a cada XLImage se le entrega su propio BytesIO."""
-    insertadas = 0
-    for i, jpeg in enumerate(imagenes_jpeg):
-        if not jpeg:
-            continue
-        celda = calcular_celda_imagen(i)
-        try:
-            img = XLImage(io.BytesIO(jpeg))
-            img.width = TARGET_WIDTH
-            img.height = TARGET_HEIGHT
-            ws.add_image(img, celda)
-            insertadas += 1
-        except Exception as e:
-            logger.error(f"Error al insertar la imagen '{nombres[i]}': {e}")
-    return insertadas
+@st.cache_data(show_spinner=False, max_entries=300)
+def _base_editor(huella_archivo: str, rot: int, _datos: bytes):
+    """Versión liviana (máx. 700 px) de la foto, rotada y sin recortar, para el
+    editor y para calcular encuadres."""
+    return abrir_normalizada(_datos, 700, {"rot": rot})
 
 
-# --------------------------------------------------------------------------
-# Generación del reporte
-# --------------------------------------------------------------------------
-def _escribir_celda(ws, coordenada: str, valor) -> None:
-    """Escribe un valor aunque la celda forme parte de un rango combinado
-    (en ese caso se escribe en la celda superior izquierda del rango, que
-    es la única editable). Evita el error "'MergedCell' object attribute
-    'value' is read-only"."""
-    celda = ws[coordenada]
-    if isinstance(celda, MergedCell):
-        for rango in ws.merged_cells.ranges:
-            if coordenada in rango:
-                ws.cell(row=rango.min_row, column=rango.min_col).value = valor
-                return
-        logger.warning(f"No se pudo escribir en la celda combinada {coordenada}.")
-        return
-    celda.value = valor
+def base_editor(archivo, rot: int):
+    return _base_editor(huella(archivo), rot, archivo.getvalue())
 
 
-def _ancho_columna(ws, letra: str) -> float:
-    dim = ws.column_dimensions.get(letra)
-    return dim.width if dim is not None and dim.width else 8.43
-
-
-def _ajustar_alto_celda_texto(ws, coordenada: str, texto: str) -> None:
-    """Si el texto no cabe en el recuadro combinado (ej. C16:I18), agranda
-    el alto de sus filas para que se lea completo en el Excel. Las fotos
-    están ancladas a celdas, así que se desplazan solas hacia abajo."""
-    if not texto:
-        return
-    rango = next((r for r in ws.merged_cells.ranges if coordenada in r), None)
-    if rango is None:
-        return
-    ancho_chars = sum(
-        _ancho_columna(ws, openpyxl.utils.get_column_letter(c))
-        for c in range(rango.min_col, rango.max_col + 1)
-    ) * 1.05  # ~caracteres por línea con fuente de 10-11 pt
-    lineas = 0
-    for parrafo in str(texto).split("\n"):
-        lineas += max(1, -(-len(parrafo) // max(int(ancho_chars), 1)))  # división hacia arriba
-    alto_necesario = lineas * 15.0 + 4
-    filas = list(range(rango.min_row, rango.max_row + 1))
-    alto_actual = sum((ws.row_dimensions[f].height or 15.0) for f in filas)
-    if alto_necesario <= alto_actual:
-        return
-    alto_por_fila = min(alto_necesario / len(filas), 409)  # 409 = máximo de Excel
-    for f in filas:
-        ws.row_dimensions[f].height = alto_por_fila
-
-    celda = ws.cell(row=rango.min_row, column=rango.min_col)
-    al = celda.alignment
-    celda.alignment = openpyxl.styles.Alignment(
-        horizontal=al.horizontal, vertical=al.vertical or "top", wrap_text=True,
-        indent=al.indent, text_rotation=al.text_rotation, shrink_to_fit=False,
-    )
-
-
-# C20 (repuestos) mantiene el alto original de la plantilla aunque no se vea todo.
-CAMPOS_TEXTO_LARGO = ("queja_cliente", "diagnostico_tecnico", "trabajo_realizado")
-
-
-def _armar_excel(plantilla_bytes: bytes, valores: dict, imagenes_jpeg: list, nombres: list) -> tuple:
-    wb = openpyxl.load_workbook(io.BytesIO(plantilla_bytes))
-    ws = wb.active
-    for campo, celda in CELDAS_EXCEL.items():
-        _escribir_celda(ws, celda, valores.get(campo, ""))
-    for campo in CAMPOS_TEXTO_LARGO:
-        _ajustar_alto_celda_texto(ws, CELDAS_EXCEL[campo], valores.get(campo, ""))
-    n_insertadas = insertar_imagenes(ws, imagenes_jpeg, nombres)
+@st.cache_data(show_spinner=False, max_entries=100)
+def _data_url(huella_archivo: str, rot: int, _datos: bytes) -> str:
+    img = _base_editor(huella_archivo, rot, _datos)
     buffer = io.BytesIO()
-    wb.save(buffer)
-    return buffer.getvalue(), n_insertadas
+    img.save(buffer, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
 
 
-def _peso_base_excel(plantilla_bytes: bytes, valores: dict) -> int:
-    """Peso del reporte SIN fotos (plantilla + datos)."""
-    excel, _ = _armar_excel(plantilla_bytes, valores, [], [])
-    return len(excel)
-
-
-def extraer_valores(clasificacion: dict) -> dict:
-    """Lee los PDF y devuelve los valores sugeridos para cada celda."""
-    datos_ot = extraer_datos_pdf(clasificacion["pdf_orden"] or "")
-    datos_garantias = extraer_datos_from_garantias_pdf(clasificacion["pdf_garantias"] or "")
-
-    valores = {
-        "vin": datos_ot["vin"],
-        "fecha_falla": datos_ot["fecha_falla"],
-        "fecha_cierre_ot": datos_ot["fecha_cierre_ot"],
-        "km": datos_ot["km"],
-        "concesionario": datos_ot["concesionario"],
-        "asesor_responsable": datos_ot["asesor_responsable"],
-        "tecnico": datos_ot.get("tecnico", ""),
-        "trabajo_realizado": datos_ot.get("trabajo_realizado", ""),
-        "queja_cliente": datos_garantias.get("queja_cliente_garantias", ""),
-        "diagnostico_tecnico": datos_garantias.get("diagnostico_tecnico_garantias", ""),
-        "repuestos_usados": datos_garantias.get("repuestos_usados_garantias", ""),
-    }
-    return valores
-
-
-def clave_foto(archivo) -> str:
-    """Identificador de una foto subida (nombre + tamaño), para guardar sus
-    ediciones aunque Streamlit vuelva a ejecutar la página."""
-    return f"{archivo.name}|{len(archivo.getvalue())}"
-
-
-def generar_reporte(valores: dict, imagenes: list, ediciones: dict = None) -> tuple:
-    """Arma el Excel con los valores YA REVISADOS por el usuario y las fotos
-    (con sus ediciones de rotación/recorte, si las hay).
-    Devuelve (bytes_excel, faltantes, n_imagenes_insertadas, info_peso).
-
-    El reporte resultante nunca supera LIMITE_REPORTE_BYTES (25 MB)."""
-    faltantes = validar_campos_criticos(valores)
-
-    plantilla_bytes = cargar_plantilla_predeterminada()
-    if not plantilla_bytes:
-        raise RuntimeError(
-            f"No se encontró la plantilla '{TEMPLATE_FILENAME}' junto a la app. "
-            f"Agrega el archivo '{TEMPLATE_FILENAME}' al repositorio."
-        )
-
-    ediciones = ediciones or {}
-    fotos = [(a.name, a.getvalue(), ediciones.get(clave_foto(a))) for a in imagenes]
-    nombres = [f[0] for f in fotos]
-
-    # Presupuesto para fotos = objetivo - peso de la plantilla con datos
-    # - un pequeño margen por la estructura XML/relaciones de cada imagen.
-    peso_base = _peso_base_excel(plantilla_bytes, valores)
-    overhead_fotos = 4 * 1024 * len(fotos)
-    presupuesto = max(OBJETIVO_REPORTE_BYTES - peso_base - overhead_fotos, 1 * MB)
-
-    imagenes_jpeg, info = comprimir_fotos_para_limite(fotos, presupuesto)
-    excel_bytes, n_insertadas = _armar_excel(plantilla_bytes, valores, imagenes_jpeg, nombres)
-
-    # Verificación final con el tamaño REAL del archivo. Si por algún motivo
-    # se pasó, se reduce el presupuesto y se vuelve a comprimir.
-    intentos = 0
-    while len(excel_bytes) > LIMITE_REPORTE_BYTES and intentos < 3 and fotos:
-        exceso = len(excel_bytes) - OBJETIVO_REPORTE_BYTES
-        presupuesto = max(presupuesto - exceso - 512 * 1024, 1 * MB)
-        imagenes_jpeg, info = comprimir_fotos_para_limite(fotos, presupuesto)
-        excel_bytes, n_insertadas = _armar_excel(plantilla_bytes, valores, imagenes_jpeg, nombres)
-        intentos += 1
-
-    info.update({
-        "peso_final_bytes": len(excel_bytes),
-        "peso_original_fotos_bytes": sum(len(f[1]) for f in fotos),
-        "bajo_limite": len(excel_bytes) <= LIMITE_REPORTE_BYTES,
-        "n_fotos": len(fotos),
-    })
-    return excel_bytes, faltantes, n_insertadas, info
+def data_url_editor(archivo, rot: int) -> str:
+    return _data_url(huella(archivo), rot, archivo.getvalue())
 
 
 # --------------------------------------------------------------------------
@@ -1052,7 +342,8 @@ with _col_carga:
         key=f"cargador_{st.session_state.get('n_cargador', 0)}",
     )
 
-clasificacion = clasificar_archivos_subidos(archivos_subidos or [])
+clasificacion = clasificar_archivos_subidos(archivos_subidos or [], leer_pdf=leer_pdf_cache,
+                                             es_imagen=imagen_valida_cache)
 
 
 # --------------------------------------------------------------------------
@@ -1177,16 +468,6 @@ if clasificacion["ignorados"]:
 if "ediciones" not in st.session_state:
     st.session_state["ediciones"] = {}   # clave_foto -> {"rot": int, "crop": tuple|None}
 EDICIONES = st.session_state["ediciones"]
-PROPORCION_RECUADRO = (TARGET_WIDTH, TARGET_HEIGHT)  # forma del recuadro de la foto en el informe
-
-
-@st.cache_data(show_spinner=False, max_entries=300)
-def _miniatura_jpeg(datos: bytes, rot: int, crop, lado: int) -> bytes:
-    edicion = {"rot": rot, "crop": crop}
-    img = _abrir_normalizada(datos, lado, edicion)
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=80)
-    return buffer.getvalue()
 
 
 def _edicion_de(clave: str) -> dict:
@@ -1222,38 +503,6 @@ def restablecer_foto(clave: str) -> None:
     cerrar_recorte()
 
 
-@st.cache_data(show_spinner=False, max_entries=300)
-def _base_editor(datos: bytes, rot: int) -> PILImage.Image:
-    """Versión liviana (máx. 700 px) de la foto, rotada y sin recortar, para el
-    editor y para calcular encuadres. Se guarda en caché: el editor responde rápido."""
-    return _abrir_normalizada(datos, 700, {"rot": rot})
-
-
-def calcular_encuadre(w: int, h: int, zoom: float = 1.0, px: float = 0.5, py: float = 0.5) -> tuple:
-    """Recorte con la MISMA forma que el recuadro de la foto en el informe
-    (así no sale estirada). zoom 1 = el recorte más grande que cabe en la foto;
-    px/py = posición 0-1 (izquierda→derecha, arriba→abajo). Nunca se sale de la foto."""
-    proporcion = PROPORCION_RECUADRO[0] / PROPORCION_RECUADRO[1]
-    if w / h > proporcion:
-        alto, ancho = h, h * proporcion
-    else:
-        ancho, alto = w, w / proporcion
-    ancho, alto = ancho / zoom, alto / zoom
-    izq, arr = px * (w - ancho), py * (h - alto)
-    return (izq / w, arr / h, (izq + ancho) / w, (arr + alto) / h)
-
-
-def _dibujar_marco(img: PILImage.Image, crop) -> PILImage.Image:
-    """Oscurece lo que queda fuera del recorte y dibuja un marco amarillo."""
-    w, h = img.size
-    caja = (crop[0] * w, crop[1] * h, crop[2] * w - 1, crop[3] * h - 1)
-    mascara = PILImage.new("L", img.size, 150)
-    ImageDraw.Draw(mascara).rectangle(caja, fill=0)
-    salida = PILImage.composite(PILImage.new("RGB", img.size, (0, 0, 0)), img, mascara)
-    ImageDraw.Draw(salida).rectangle(caja, outline=(255, 192, 0), width=4)
-    return salida
-
-
 def encuadrar_todas(archivos: list) -> None:
     """Aplica a todas las fotos SIN recorte propio un encuadre centrado con la
     forma del recuadro del informe. Las que ya se recortaron a mano no se tocan."""
@@ -1263,7 +512,7 @@ def encuadrar_todas(archivos: list) -> None:
         if ed.get("crop"):
             continue
         try:
-            w, h = _base_editor(archivo.getvalue(), ed.get("rot", 0)).size
+            w, h = base_editor(archivo, ed.get("rot", 0)).size
         except Exception:
             continue
         ed["crop"] = calcular_encuadre(w, h)
@@ -1278,249 +527,7 @@ def quitar_recortes_todas(archivos: list) -> None:
             EDICIONES[clave] = {**EDICIONES[clave], "crop": None, "ajuste": None}
 
 
-# ---- Recortador interactivo propio (sin librerías externas) --------------
-# Componente "bidireccional" sin compilación: un index.html que habla con
-# Streamlit por postMessage. El recuadro se mueve en el navegador (fluido) y
-# solo avisa a la app al SOLTAR el mouse; nunca se sale de la foto.
-_HTML_RECORTADOR = r"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden;
-               user-select: none; -webkit-user-select: none; }
-  #zona { position: relative; margin: 0 auto; overflow: hidden; touch-action: none; }
-  #zona img { display: block; width: 100%; height: 100%; pointer-events: none; }
-  #caja { position: absolute; border: 2px solid #FFC000; box-sizing: border-box; cursor: move;
-          box-shadow: 0 0 0 9999px rgba(0, 0, 0, .55); touch-action: none; }
-  #caja::before, #caja::after { content: ""; position: absolute; border: 0 dashed rgba(255,192,0,.5); }
-  #caja::before { left: 33.3%; right: 33.3%; top: 0; bottom: 0; border-left-width: 1px; border-right-width: 1px; }
-  #caja::after  { top: 33.3%; bottom: 33.3%; left: 0; right: 0; border-top-width: 1px; border-bottom-width: 1px; }
-  .esq { position: absolute; width: 18px; height: 18px; background: #FFC000; border: 2px solid #002060;
-         border-radius: 3px; box-sizing: border-box; touch-action: none; z-index: 2; }
-  .nw { left: -9px; top: -9px; cursor: nwse-resize; }   .ne { right: -9px; top: -9px; cursor: nesw-resize; }
-  .sw { left: -9px; bottom: -9px; cursor: nesw-resize; } .se { right: -9px; bottom: -9px; cursor: nwse-resize; }
-</style></head>
-<body>
-<div id="zona"><img id="img" alt=""><div id="caja">
-  <div class="esq nw" data-c="nw"></div><div class="esq ne" data-c="ne"></div>
-  <div class="esq sw" data-c="sw"></div><div class="esq se" data-c="se"></div>
-</div></div>
-<script>
-  // Recortador propio, sin librerías externas.
-  // Estado en píxeles de pantalla: x, y, w, h del recuadro dentro de la foto (W x H).
-  function enviar(tipo, extra) {
-    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: tipo}, extra || {}), "*");
-  }
-  var zona = document.getElementById("zona"), img = document.getElementById("img"),
-      caja = document.getElementById("caja");
-  var W = 0, H = 0, aspecto = null, ultimaClave = null, MIN = 24;
-  var r = {x: 0, y: 0, w: 0, h: 0}, arrastre = null;
-
-  function pintar() {
-    caja.style.left = r.x + "px"; caja.style.top = r.y + "px";
-    caja.style.width = r.w + "px"; caja.style.height = r.h + "px";
-  }
-  function enviarValor() {
-    enviar("streamlit:setComponentValue", {dataType: "json", value: {
-      l: r.x / W, t: r.y / H, r: (r.x + r.w) / W, b: (r.y + r.h) / H}});
-  }
-  function ajustarAspecto() {          // fuerza la forma y lo deja dentro de la foto
-    if (aspecto) {
-      if (r.w / r.h > aspecto) r.w = r.h * aspecto; else r.h = r.w / aspecto;
-    }
-    r.w = Math.min(r.w, W); r.h = Math.min(r.h, H);
-    if (aspecto) { if (r.w / r.h > aspecto) r.w = r.h * aspecto; else r.h = r.w / aspecto; }
-    r.x = Math.min(Math.max(r.x, 0), W - r.w); r.y = Math.min(Math.max(r.y, 0), H - r.h);
-  }
-  function punto(e) {
-    var b = zona.getBoundingClientRect();
-    return {x: e.clientX - b.left, y: e.clientY - b.top};
-  }
-  function iniciar(e) {
-    e.preventDefault(); e.stopPropagation();
-    var esquina = e.target.getAttribute("data-c");
-    var p = punto(e);
-    arrastre = {esquina: esquina, p0: p, r0: {x: r.x, y: r.y, w: r.w, h: r.h}};
-    if (esquina) {                     // la esquina opuesta queda fija
-      arrastre.ax = esquina.indexOf("w") >= 0 ? r.x + r.w : r.x;
-      arrastre.ay = esquina.indexOf("n") >= 0 ? r.y + r.h : r.y;
-      arrastre.izq = esquina.indexOf("w") >= 0; arrastre.arr = esquina.indexOf("n") >= 0;
-    }
-    try { e.target.setPointerCapture(e.pointerId); } catch (err) {}
-  }
-  function mover(e) {
-    if (!arrastre) return;
-    e.preventDefault();
-    var p = punto(e), a = arrastre;
-    if (!a.esquina) {                  // mover el recuadro completo
-      r.x = Math.min(Math.max(a.r0.x + p.x - a.p0.x, 0), W - r.w);
-      r.y = Math.min(Math.max(a.r0.y + p.y - a.p0.y, 0), H - r.h);
-    } else {                           // redimensionar desde una esquina
-      var maxW = a.izq ? a.ax : W - a.ax, maxH = a.arr ? a.ay : H - a.ay;
-      var nw = Math.abs(p.x - a.ax), nh = Math.abs(p.y - a.ay);
-      if (aspecto) {
-        nw = Math.max(nw, nh * aspecto);
-        nw = Math.min(nw, maxW, maxH * aspecto);
-        nw = Math.max(nw, MIN * aspecto); nh = nw / aspecto;
-      } else {
-        nw = Math.max(MIN, Math.min(nw, maxW)); nh = Math.max(MIN, Math.min(nh, maxH));
-      }
-      r.w = nw; r.h = nh;
-      r.x = a.izq ? a.ax - nw : a.ax; r.y = a.arr ? a.ay - nh : a.ay;
-    }
-    pintar();
-  }
-  function soltar() { if (arrastre) { arrastre = null; enviarValor(); } }
-
-  caja.addEventListener("pointerdown", iniciar);
-  window.addEventListener("pointermove", mover);
-  window.addEventListener("pointerup", soltar);
-  window.addEventListener("pointercancel", soltar);
-
-  function render(args) {
-    if (args.clave === ultimaClave) return;   // no reiniciar el recuadro en cada actualización
-    ultimaClave = args.clave;
-    aspecto = args.aspect || null;
-    var disponible = document.body.clientWidth || 700;
-    W = Math.min(disponible, args.alto_max * args.w / args.h);
-    H = W * args.h / args.w;
-    zona.style.width = W + "px"; zona.style.height = H + "px";
-    enviar("streamlit:setFrameHeight", {height: Math.ceil(H) + 4});
-    var c = args.inicial;
-    if (c) {
-      r = {x: c[0] * W, y: c[1] * H, w: (c[2] - c[0]) * W, h: (c[3] - c[1]) * H};
-    } else {                           // por defecto: 90 % del máximo, centrado
-      r = {w: W, h: H, x: 0, y: 0};
-      if (aspecto) { if (W / H > aspecto) r.w = H * aspecto; else r.h = W / aspecto; }
-      r.w *= 0.9; r.h *= 0.9; r.x = (W - r.w) / 2; r.y = (H - r.h) / 2;
-    }
-    ajustarAspecto();
-    img.src = args.src;
-    pintar();
-    enviarValor();
-  }
-  window.addEventListener("message", function (e) {
-    if (e.data && e.data.type === "streamlit:render") render(e.data.args);
-  });
-  enviar("streamlit:componentReady", {apiVersion: 1});
-</script>
-</body></html>
-"""
-
-
-@st.cache_resource(show_spinner=False)
-def _declarar_componente(nombre: str, html: str):
-    """Escribe el index.html de un componente propio en una carpeta temporal y
-    lo registra en Streamlit (una sola vez por servidor). None si falla."""
-    try:
-        import streamlit.components.v1 as components
-        carpeta = Path(tempfile.gettempdir()) / f"{nombre}_v1"
-        carpeta.mkdir(parents=True, exist_ok=True)
-        (carpeta / "index.html").write_text(html, encoding="utf-8")
-        return components.declare_component(nombre, path=str(carpeta))
-    except Exception as e:
-        logger.error(f"No se pudo preparar el componente '{nombre}': {e}")
-        return None
-
-
-def _declarar_recortador():
-    return _declarar_componente("astara_recortador", _HTML_RECORTADOR)
-
-
-# ---- Ordenador de fotos arrastrando (sin librerías externas) -------------
-_HTML_ORDENADOR = r"""<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden;
-               font-family: "Source Sans Pro", "Segoe UI", sans-serif; }
-  #grid { display: flex; flex-wrap: wrap; gap: 8px; padding: 6px 2px; }
-  .item { width: 128px; background: #142449; border: 2px solid #2A3F70; border-radius: 8px;
-          padding: 4px; cursor: grab; position: relative; box-sizing: border-box; }
-  .item:active { cursor: grabbing; }
-  .item.prio { border-color: #FFC000; }
-  .item img { width: 100%; height: 70px; object-fit: cover; border-radius: 4px; display: block;
-              pointer-events: none; }
-  .item .n { position: absolute; top: 7px; left: 7px; background: #002060; color: #FFC000;
-             font-weight: 700; border-radius: 4px; padding: 0 6px; font-size: 13px; }
-  .item .nom { color: #E6ECF7; font-size: 11px; white-space: nowrap; overflow: hidden;
-               text-overflow: ellipsis; margin-top: 3px; }
-  .item.arrastrando { opacity: .3; }
-  .item.antes { box-shadow: -6px 0 0 -1px #FFC000; }
-  .item.despues { box-shadow: 6px 0 0 -1px #FFC000; }
-</style></head>
-<body><div id="grid"></div>
-<script>
-  function enviar(tipo, extra) {
-    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: tipo}, extra || {}), "*");
-  }
-  var grid = document.getElementById("grid");
-  var items = {}, orden = [], prioritarias = 2, ultimaClave = null, arrastrada = null;
-
-  function ajustarAlto() { enviar("streamlit:setFrameHeight", {height: grid.scrollHeight + 4}); }
-  function limpiarMarcas() {
-    grid.querySelectorAll(".antes, .despues").forEach(function (el) { el.classList.remove("antes", "despues"); });
-  }
-  function dibujar() {
-    grid.innerHTML = "";
-    orden.forEach(function (k, i) {
-      var it = items[k], d = document.createElement("div");
-      d.className = "item" + (i < prioritarias ? " prio" : "");
-      d.draggable = true; d.dataset.k = k;
-      d.title = it.nombre + " — arrastra para mover";
-      d.innerHTML = '<img src="' + it.src + '"><span class="n">' + (i < prioritarias ? "⭐ " : "") +
-                    (i + 1) + '</span><div class="nom"></div>';
-      d.querySelector(".nom").textContent = it.nombre;
-      d.addEventListener("dragstart", function (e) {
-        arrastrada = k; d.classList.add("arrastrando");
-        e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", k);
-      });
-      d.addEventListener("dragend", function () { d.classList.remove("arrastrando"); limpiarMarcas(); arrastrada = null; });
-      d.addEventListener("dragover", function (e) {
-        e.preventDefault(); e.dataTransfer.dropEffect = "move";
-        if (!arrastrada || arrastrada === k) return;
-        var r = d.getBoundingClientRect(), antes = e.clientX < r.left + r.width / 2;
-        limpiarMarcas(); d.classList.add(antes ? "antes" : "despues");
-      });
-      d.addEventListener("drop", function (e) {
-        e.preventDefault();
-        var origen = arrastrada || e.dataTransfer.getData("text/plain");
-        limpiarMarcas();
-        if (!origen || origen === k) return;
-        var r = d.getBoundingClientRect(), antes = e.clientX < r.left + r.width / 2;
-        orden.splice(orden.indexOf(origen), 1);
-        var destino = orden.indexOf(k) + (antes ? 0 : 1);
-        orden.splice(destino, 0, origen);
-        dibujar();
-        enviar("streamlit:setComponentValue", {dataType: "json", value: {orden: orden.slice(), id: Date.now()}});
-      });
-      grid.appendChild(d);
-    });
-    setTimeout(ajustarAlto, 0);
-  }
-  function render(args) {
-    if (args.clave === ultimaClave) return;
-    ultimaClave = args.clave;
-    items = {}; orden = [];
-    prioritarias = args.prioritarias || 2;
-    args.items.forEach(function (it) { items[it.k] = it; orden.push(it.k); });
-    dibujar();
-  }
-  window.addEventListener("message", function (e) {
-    if (e.data && e.data.type === "streamlit:render") render(e.data.args);
-  });
-  window.addEventListener("resize", ajustarAlto);
-  enviar("streamlit:componentReady", {apiVersion: 1});
-</script></body></html>
-"""
-
-
-@st.cache_data(show_spinner=False, max_entries=100)
-def _data_url_editor(datos: bytes, rot: int) -> str:
-    img = _base_editor(datos, rot)
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85)
-    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode()
-
-
+# ---- Editor de recorte (usa el recortador propio de reporte/componentes.py) ----
 def _editor_recorte(archivo) -> None:
     """Editor de recorte de UNA foto (en ventana emergente): recuadro que se
     agranda/achica desde las esquinas y se mueve arrastrándolo, manteniendo
@@ -1528,7 +535,7 @@ def _editor_recorte(archivo) -> None:
     clave = clave_foto(archivo)
     ed = _edicion_de(clave)
     rot = ed.get("rot", 0)
-    base = _base_editor(archivo.getvalue(), rot)
+    base = base_editor(archivo, rot)
     w, h = base.size
 
     libre = st.checkbox(
@@ -1540,11 +547,11 @@ def _editor_recorte(archivo) -> None:
     st.caption("Arrastra las **esquinas** del recuadro amarillo para agrandarlo o achicarlo y "
                "arrástralo desde el **centro** para moverlo. Luego pulsa *Aplicar recorte*.")
 
-    recortador = _declarar_recortador()
+    recortador = componente_recortador()
     crop = None
     if recortador is not None:
         valor = recortador(
-            src=_data_url_editor(archivo.getvalue(), rot), w=w, h=h,
+            src=data_url_editor(archivo, rot), w=w, h=h,
             aspect=None if libre else PROPORCION_RECUADRO[0] / PROPORCION_RECUADRO[1],
             inicial=list(ed["crop"]) if ed.get("crop") else None,
             clave=f"{clave}|{rot}|{libre}", alto_max=520,
@@ -1563,7 +570,7 @@ def _editor_recorte(archivo) -> None:
         if usar_sl or crop is None:
             crop = calcular_encuadre(w, h, zoom / 100, px / 100, py / 100)
             modo_guardado = "encuadre"
-            st.image(_dibujar_marco(base, crop), width=420)
+            st.image(dibujar_marco(base, crop), width=420)
 
     if crop:
         c1, _ = st.columns([1, 2])
@@ -1630,14 +637,14 @@ if clasificacion["imagenes"]:
                 _editor_recorte(archivo_en_recorte)
 
     # ---- Ordenar arrastrando ----
-    ordenador = _declarar_componente("astara_ordenador", _HTML_ORDENADOR)
+    ordenador = componente_ordenador()
     if ordenador is not None and len(FOTOS_INFORME) > 1:
         st.markdown("**🔀 Arrastra las fotos para cambiar el orden** "
                     "· las 2 primeras (borde amarillo) van en alta calidad")
         items_orden, firma = [], []
         for a in FOTOS_INFORME:
             ed = _edicion_de(clave_foto(a))
-            mini = _miniatura_jpeg(a.getvalue(), ed.get("rot", 0), ed.get("crop"), 220)
+            mini = miniatura_jpeg(a, ed.get("rot", 0), ed.get("crop"), 220)
             items_orden.append({"k": clave_foto(a), "nombre": a.name,
                                 "src": "data:image/jpeg;base64," + base64.b64encode(mini).decode()})
             firma.append(f"{clave_foto(a)}:{ed.get('rot', 0)}:{ed.get('crop')}")
@@ -1670,7 +677,7 @@ if clasificacion["imagenes"]:
             estrella = "⭐ " if i < N_FOTOS_PRIORITARIAS else ""
             with columnas[j]:
                 try:
-                    st.image(_miniatura_jpeg(archivo.getvalue(), ed.get("rot", 0), ed.get("crop"), 480),
+                    st.image(miniatura_jpeg(archivo, ed.get("rot", 0), ed.get("crop"), 480),
                              use_container_width=True)
                 except Exception:
                     st.warning("No se pudo mostrar esta foto.")
@@ -1697,7 +704,7 @@ if clasificacion["imagenes"]:
                 ed = _edicion_de(clave)
                 with columnas_fuera[k % 6]:
                     try:
-                        st.image(_miniatura_jpeg(archivo.getvalue(), ed.get("rot", 0), ed.get("crop"), 300),
+                        st.image(miniatura_jpeg(archivo, ed.get("rot", 0), ed.get("crop"), 300),
                                  use_container_width=True)
                     except Exception:
                         pass
