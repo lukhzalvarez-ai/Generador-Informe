@@ -142,6 +142,12 @@ NOMBRE_PDF_ORDEN = "orden de trabajo"
 
 NOMBRES_PDF_GARANTIAS = {"trabajo en garantias", "trabajo en garantia"}
 
+# Archivos ZIP: se abren y se usa lo que traigan adentro (fotos y los 2 PDF).
+# Límites de seguridad para que un ZIP dañado o malicioso no tumbe el servidor.
+ZIP_MAX_DESCOMPRIMIDO = 800 * MB     # suma de lo extraído de un ZIP
+ZIP_MAX_ARCHIVO = 150 * MB           # cada archivo dentro del ZIP
+ZIP_MAX_ELEMENTOS = 500              # cantidad de archivos dentro del ZIP
+
 # Plantilla: siempre la incluida en el repositorio, junto a app.py.
 TEMPLATE_FILENAME = "Reporte_de_falla_Astara.xlsx"
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / TEMPLATE_FILENAME

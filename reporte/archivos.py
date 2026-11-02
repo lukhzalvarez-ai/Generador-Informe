@@ -4,13 +4,95 @@ de forma barata (sin recorrer los megas completos)."""
 
 import io
 import re
+import zipfile
 import hashlib
 import unicodedata
+from pathlib import PurePosixPath
 
 from PIL import Image as PILImage
 
-from .config import EXTENSIONES_IMAGEN, NOMBRE_PDF_ORDEN, NOMBRES_PDF_GARANTIAS
+from .config import (logger, MB, EXTENSIONES_IMAGEN, NOMBRE_PDF_ORDEN, NOMBRES_PDF_GARANTIAS,
+                     ZIP_MAX_DESCOMPRIMIDO, ZIP_MAX_ARCHIVO, ZIP_MAX_ELEMENTOS)
 from .pdf import extraer_texto_pdf
+
+
+class ArchivoEnMemoria(io.BytesIO):
+    """Archivo extraído de un ZIP que se comporta igual que un archivo subido
+    (tiene .name, .size y .getvalue()), así el resto de la app no distingue."""
+
+    def __init__(self, nombre: str, datos: bytes, origen: str = ""):
+        super().__init__(datos)
+        self.name = nombre
+        self.size = len(datos)
+        self.origen = origen     # nombre del ZIP del que salió
+
+
+def _nombre_en_zip(info: zipfile.ZipInfo) -> str:
+    """Nombre real del archivo dentro del ZIP. El compresor de Windows guarda
+    los nombres con tildes en la codificación antigua del sistema (cp850) sin
+    avisarlo; Python los lee como cp437 y 'Garantías' saldría 'Garant¡as'.
+    Se corrige para que los PDF se reconozcan igual."""
+    nombre = info.filename
+    if not info.flag_bits & 0x800:          # el ZIP no declara UTF-8
+        try:
+            nombre = nombre.encode("cp437").decode("cp850")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+    return nombre
+
+
+def es_zip(archivo) -> bool:
+    return archivo.name.lower().endswith(".zip")
+
+
+def expandir_zip(nombre_zip: str, datos: bytes) -> tuple:
+    """Abre un ZIP y devuelve (archivos_utiles, ignorados, avisos):
+      - archivos_utiles: fotos y PDF como ArchivoEnMemoria (de cualquier subcarpeta)
+      - ignorados: nombres de lo que no corresponde (Excel, Word, ZIP dentro de ZIP...)
+      - avisos: problemas para mostrar al usuario (dañado, con clave, muy grande)."""
+    utiles, ignorados, avisos = [], [], []
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(datos))
+    except zipfile.BadZipFile:
+        return [], [], [f"'{nombre_zip}' no es un ZIP válido o está dañado."]
+
+    with zf:
+        elementos = [i for i in zf.infolist() if not i.is_dir()]
+        if len(elementos) > ZIP_MAX_ELEMENTOS:
+            avisos.append(f"'{nombre_zip}' trae {len(elementos)} archivos; solo se revisaron los primeros "
+                          f"{ZIP_MAX_ELEMENTOS}.")
+            elementos = elementos[:ZIP_MAX_ELEMENTOS]
+        total = 0
+        for info in elementos:
+            nombre = PurePosixPath(_nombre_en_zip(info).replace("\\", "/")).name
+            # basura de macOS/Windows que no son archivos reales
+            if not nombre or nombre.startswith("._") or "__MACOSX" in info.filename \
+                    or nombre.lower() in ("thumbs.db", "desktop.ini", ".ds_store"):
+                continue
+            ext = nombre.lower().rsplit(".", 1)[-1] if "." in nombre else ""
+            if ext != "pdf" and ext not in EXTENSIONES_IMAGEN:
+                ignorados.append(f"{nombre} (en {nombre_zip})")
+                continue
+            if info.flag_bits & 0x1:
+                avisos.append(f"'{nombre}' dentro de '{nombre_zip}' está protegido con clave y no se pudo abrir.")
+                continue
+            if info.file_size > ZIP_MAX_ARCHIVO:
+                avisos.append(f"'{nombre}' dentro de '{nombre_zip}' es demasiado grande "
+                              f"({info.file_size / MB:.0f} MB) y se omitió.")
+                continue
+            if total + info.file_size > ZIP_MAX_DESCOMPRIMIDO:
+                avisos.append(f"'{nombre_zip}' es demasiado grande al descomprimir; se usaron solo los "
+                              f"primeros {ZIP_MAX_DESCOMPRIMIDO // MB} MB.")
+                break
+            try:
+                contenido = zf.read(info)
+            except Exception as e:
+                logger.error(f"No se pudo extraer '{nombre}' de '{nombre_zip}': {e}")
+                avisos.append(f"'{nombre}' dentro de '{nombre_zip}' está dañado y se omitió.")
+                continue
+            total += len(contenido)
+            utiles.append(ArchivoEnMemoria(nombre, contenido, origen=nombre_zip))
+    return utiles, ignorados, avisos
 
 
 def tamano(archivo) -> int:
