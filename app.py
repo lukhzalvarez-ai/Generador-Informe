@@ -30,7 +30,7 @@ from reporte.config import (
 )
 from reporte.pdf import extraer_texto_pdf, extraer_valores, validar_campos_criticos
 from reporte.archivos import (
-    clasificar_archivos_subidos, clave_foto, huella, _es_imagen_valida,
+    clasificar_archivos_subidos, clave_foto, huella, _es_imagen_valida, es_zip, expandir_zip,
 )
 from reporte.imagenes import (
     abrir_normalizada, aplicar_edicion, calcular_celda_imagen, calcular_encuadre, dibujar_marco,
@@ -95,6 +95,28 @@ def _data_url(huella_archivo: str, rot: int, _datos: bytes) -> str:
 
 def data_url_editor(archivo, rot: int) -> str:
     return _data_url(huella(archivo), rot, archivo.getvalue())
+
+
+# cache_resource (no cache_data) para NO copiar los megas extraídos en cada clic.
+@st.cache_resource(show_spinner="Abriendo ZIP…", max_entries=6, ttl=3600)
+def _contenido_zip(huella_archivo: str, _datos: bytes, nombre: str) -> tuple:
+    return expandir_zip(nombre, _datos)
+
+
+def expandir_subidos(archivos: list) -> tuple:
+    """Reemplaza cada ZIP subido por los archivos que trae adentro.
+    Devuelve (archivos, ignorados_en_zip, avisos, resumen_zips)."""
+    salida, ignorados, avisos, resumen = [], [], [], []
+    for a in archivos:
+        if es_zip(a):
+            utiles, ign, av = _contenido_zip(huella(a), a.getvalue(), a.name)
+            salida += utiles
+            ignorados += ign
+            avisos += av
+            resumen.append((a.name, len(utiles)))
+        else:
+            salida.append(a)
+    return salida, ignorados, avisos, resumen
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +303,7 @@ with st.sidebar:
            - `Orden de Trabajo.pdf`
            - `Trabajo en Garantías.pdf`
            - Fotos del vehículo
+           - o un **ZIP** con todo lo anterior (se abre solo)
         2. Los PDF **deben llamarse exactamente así**. Cualquier otro
            PDF, Excel, Word, etc. se ignora automáticamente.
         3. La plantilla del **Reporte Técnico Astara ya viene integrada**.
@@ -337,13 +360,16 @@ with _col_reset:
 # carpeta completa sin errores, y la app descarta lo que no corresponde.
 with _col_carga:
     archivos_subidos = st.file_uploader(
-        "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf' y/o fotos (todo opcional; lo demás se ignora)",
+        "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf' y/o fotos, sueltos o en un ZIP "
+        "(todo opcional; lo demás se ignora)",
         accept_multiple_files=True,
         key=f"cargador_{st.session_state.get('n_cargador', 0)}",
     )
 
-clasificacion = clasificar_archivos_subidos(archivos_subidos or [], leer_pdf=leer_pdf_cache,
+archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(archivos_subidos or [])
+clasificacion = clasificar_archivos_subidos(archivos_expandidos, leer_pdf=leer_pdf_cache,
                                              es_imagen=imagen_valida_cache)
+clasificacion["ignorados"] += IGNORADOS_EN_ZIP
 
 
 # --------------------------------------------------------------------------
@@ -451,6 +477,10 @@ badges.append(
     + (f' (+{len(FOTOS_FUERA)} fuera del informe)' if FOTOS_FUERA else '') + '</span>'
 )
 st.markdown(" ".join(badges), unsafe_allow_html=True)
+if RESUMEN_ZIPS:
+    st.caption("📦 " + " · ".join(f"{n}: {k} archivo(s) útil(es) extraído(s)" for n, k in RESUMEN_ZIPS))
+for aviso in AVISOS_ZIP:
+    st.warning(f"📦 {aviso}")
 st.caption("Nada es obligatorio: lo que no adjuntes simplemente queda vacío en el reporte para completarlo a mano.")
 
 if clasificacion["ignorados"]:
