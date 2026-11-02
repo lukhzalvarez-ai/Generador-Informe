@@ -1001,6 +1001,8 @@ with st.sidebar:
            fuera las que sobren o estén repetidas (🗑️), rotarlas (↺ ↻)
            y recortarlas (✂️). Las fotos idénticas se excluyen solas.
         6. Genera el informe y descárgalo listo.
+        7. Para hacer otro, pulsa **🔄 Nuevo informe** (arriba a la derecha)
+           y la página queda vacía.
         """
     )
     st.caption("Formatos de foto aceptados: " + ", ".join(sorted(EXTENSIONES_IMAGEN)).upper())
@@ -1018,12 +1020,37 @@ with st.sidebar:
     if not PLANTILLA_PREDETERMINADA_DISPONIBLE:
         st.error(f"No se encontró '{TEMPLATE_FILENAME}' junto a la app. Agrégalo al repositorio.")
 
+def nuevo_informe() -> None:
+    """Deja la página vacía para empezar otro informe: borra todo lo guardado en
+    la sesión (textos, recortes, orden, exclusiones...). El cargador de archivos
+    no se puede vaciar directamente, así que se le cambia la clave para que
+    Streamlit cree uno nuevo, vacío."""
+    siguiente = st.session_state.get("n_cargador", 0) + 1
+    st.session_state.clear()
+    st.session_state["n_cargador"] = siguiente
+
+
+_col_carga, _col_reset = st.columns([5, 1])
+with _col_reset:
+    _popover = getattr(st, "popover", None)
+    if _popover is not None:
+        with _popover("🔄 Nuevo informe", use_container_width=True):
+            st.markdown("¿Empezar un informe nuevo? Se quitarán **todos los archivos, textos y "
+                        "ajustes de fotos** de la página.")
+            st.button("Sí, dejar todo vacío", type="primary", on_click=nuevo_informe,
+                      use_container_width=True, key="confirmar_nuevo_informe")
+    else:
+        st.button("🔄 Nuevo informe", on_click=nuevo_informe, use_container_width=True,
+                  key="confirmar_nuevo_informe", help="Quita todos los archivos, textos y ajustes")
+
 # Sin filtro de tipo en el cargador: así el usuario puede arrastrar una
 # carpeta completa sin errores, y la app descarta lo que no corresponde.
-archivos_subidos = st.file_uploader(
-    "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf' y/o fotos (todo opcional; lo demás se ignora)",
-    accept_multiple_files=True,
-)
+with _col_carga:
+    archivos_subidos = st.file_uploader(
+        "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf' y/o fotos (todo opcional; lo demás se ignora)",
+        accept_multiple_files=True,
+        key=f"cargador_{st.session_state.get('n_cargador', 0)}",
+    )
 
 clasificacion = clasificar_archivos_subidos(archivos_subidos or [])
 
@@ -1815,3 +1842,6 @@ if generar:
             type="primary",
             use_container_width=True,
         )
+        st.button("🔄 Empezar otro informe (dejar la página vacía)", on_click=nuevo_informe,
+                  use_container_width=True, key="nuevo_informe_final",
+                  help="Descarga primero el informe: esto quita todos los archivos, textos y ajustes.")
