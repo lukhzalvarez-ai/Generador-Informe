@@ -230,6 +230,8 @@ HTML_BORRADOR = r"""<!DOCTYPE html>
   function enviar(tipo, extra) {
     window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: tipo}, extra || {}), "*");
   }
+  // Limpia lo que dejó una versión anterior que guardaba también las fotos
+  try { indexedDB.deleteDatabase("astara_reporte_falla_archivos"); window.localStorage.removeItem("astara_reporte_falla"); } catch (e) {}
   function leer() { try { return window.localStorage.getItem(CLAVE); } catch (e) { return null; } }
   window.addEventListener("message", function (ev) {
     if (!ev.data || ev.data.type !== "streamlit:render") return;
