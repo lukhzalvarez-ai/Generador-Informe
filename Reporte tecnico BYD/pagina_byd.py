@@ -41,7 +41,7 @@ from byd.imagenes import (abrir_normalizada, aplicar_edicion, calcular_encuadre,
                           encuadre_relleno)
 from byd.excel import (  # noqa: E402
     cargar_plantilla, generar_reporte_byd, proporcion_para_indice, nombre_recuadro,
-    validar_campos_criticos, a_numero, a_fecha,
+    validar_campos_criticos, a_numero, a_fecha, alto_libre,
 )
 from byd.componentes import recortador as componente_recortador, ordenador as componente_ordenador  # noqa: E402
 
@@ -192,7 +192,8 @@ with st.sidebar:
            - **1** → *Malfunction Point* (arriba izquierda)
            - **2** → *Parts Brand (Code)* (arriba derecha)
            - **3** → *Procurement Invoice* (ancha)
-           - **4 en adelante** → filas nuevas, mismo tamaño que la 3
+           - **4 en adelante** → filas nuevas a todo el ancho
+           - desde la **3**: foto completa, la fila se adapta a su alto
         3. Revisa lo leído de los PDF y completa **a mano** (✍️):
            Report Number, Country, Sales Date, pieza en falla,
            mano de obra y repuestos.
@@ -388,7 +389,10 @@ def encuadrar_todas(archivos: list) -> None:
 
 
 def crop_en_informe(archivo, indice: int, ed: dict):
-    """Recorte con el que la foto quedará en el informe (llena su recuadro completo)."""
+    """Recorte con el que la foto quedará en el informe. Fotos 1 y 2: llenan su recuadro.
+    Desde la 3ª: foto completa a todo el ancho (o el recorte que eligió el usuario)."""
+    if alto_libre(indice):
+        return ed.get("crop")
     try:
         w, h = base_editor(archivo, ed.get("rot", 0)).size
     except Exception:
@@ -416,23 +420,30 @@ def _editor_recorte(archivo) -> None:
 
     st.caption(f"Foto {indice + 1} → **{nombre}** ({ayuda}). Arrastra las **esquinas** del recuadro "
                "para agrandarlo o achicarlo y arrástralo desde el **centro** para moverlo.")
-    libre = st.checkbox("Proporción libre", value=(ed.get("ajuste") or {}).get("modo") == "libre_arrastre",
-                        key=K(f"libre_{clave}"),
-                        help="Por defecto el recuadro tiene la forma del espacio de esta foto en el informe, "
-                             "así la foto lo llena completo. Con proporción libre la foto no se deforma: "
-                             "si no calza, queda centrada con bordes blancos.")
+    if alto_libre(indice):
+        st.caption("Esta foto va a todo el ancho del informe y la fila toma el alto que necesite: "
+                   "puedes recortarla con la forma que quieras.")
+        libre, proporcion = True, w / h
+    else:
+        libre = st.checkbox("Proporción libre", value=(ed.get("ajuste") or {}).get("modo") == "libre_arrastre",
+                            key=K(f"libre_{clave}"),
+                            help="Por defecto el recuadro tiene la forma del espacio de esta foto en el informe, "
+                                 "así la foto lo llena completo. Con proporción libre la foto no se deforma: "
+                                 "si no calza, queda centrada con bordes blancos.")
     recortador = componente_recortador()
     crop = None
     if recortador is not None:
         valor = recortador(
             src=data_url_editor(archivo, rot), w=w, h=h, aspect=None if libre else proporcion,
-            inicial=list(crop_en_informe(archivo, indice, ed) or []) or None,
+            inicial=list(crop_en_informe(archivo, indice, ed) or ([0, 0, 1, 1] if alto_libre(indice) else [])) or None,
             clave=f"{clave}|{rot}|{libre}|{round(proporcion, 3)}", alto_max=520,
             key=K(f"recortador_{clave}_{rot}_{libre}_{round(proporcion, 3)}"), default=None,
         )
         if isinstance(valor, dict) and all(k in valor for k in ("l", "t", "r", "b")):
             crop = (valor["l"], valor["t"], valor["r"], valor["b"])
     modo = "libre_arrastre" if libre else "arrastre"
+    if alto_libre(indice) and crop and all(abs(a - b) < 0.002 for a, b in zip(crop, (0, 0, 1, 1))):
+        crop = None                                   # recuadro sin mover = foto completa
     with st.expander("Alternativa: ajustar con deslizadores"):
         usar_sl = st.checkbox("Usar deslizadores en vez del recuadro", key=K(f"usar_sl_{clave}"))
         zoom = st.slider("🔍 Acercar", 100, 300, 100, step=5, format="%d%%", key=K(f"zoom_{clave}"))
@@ -472,9 +483,9 @@ else:
 if clasificacion["imagenes"]:
     st.markdown("#### 🖼️ Fotos del Service Report")
     st.caption("Orden en el informe: **1** Malfunction Point · **2** Parts Brand (Code) · "
-               "**3** Procurement Invoice · **4+** filas adicionales. Cada foto **llena su espacio completo**: "
-               "se recorta centrada con la forma del recuadro (la vista previa muestra exactamente lo que "
-               "saldrá). Si quieres otro encuadre usa ✂️. ↺ ↻ rotar · 🗑️ dejar fuera.")
+               "**3** Procurement Invoice · **4+** filas adicionales. Las fotos **1 y 2** llenan su recuadro "
+               "(se recortan centradas); desde la **3** van **completas, a todo el ancho**, y la fila toma el "
+               "alto de cada foto. La vista previa muestra lo que saldrá. ✂️ recortar · ↺ ↻ rotar · 🗑️ dejar fuera.")
     g2, g3, _ = st.columns([1.3, 1.3, 3.3])
     g2.button("🧹 Quitar todos los recortes", on_click=quitar_recortes_todas, args=(FOTOS_INFORME,),
               use_container_width=True, key=K("quitar_recortes"),

@@ -81,6 +81,12 @@ def proporcion_para_indice(indice: int) -> float:
     return p[min(indice, len(p) - 1)]
 
 
+def alto_libre(indice: int) -> bool:
+    """Desde la 3ª foto (recuadro ancho B:G) se respeta el ANCHO de la celda y el alto de
+    la fila se adapta a la foto: no se recorta (salvo que el usuario recorte a mano)."""
+    return indice >= len(RECUADROS_FOTO) - 1
+
+
 def nombre_recuadro(indice: int) -> tuple:
     """(nombre en el informe, ayuda en español) del recuadro de la foto N (0 = primera)."""
     if indice < len(RECUADROS_FOTO):
@@ -288,27 +294,54 @@ def _llenar_repuestos(ws, repuestos: list) -> int:
 # --------------------------------------------------------------------------
 # Fotos
 # --------------------------------------------------------------------------
-def _recuadros_para(n_fotos: int, desplazamiento: int) -> list:
-    """Lista de (fila, col_ini, col_fin) para cada foto, ya corrida por las filas
-    de repuestos insertadas."""
-    res = []
-    for i in range(n_fotos):
-        if i < len(RECUADROS_FOTO):
-            r = RECUADROS_FOTO[i]
-            res.append((r["fila"] + desplazamiento, r["col_ini"], r["col_fin"]))
-        else:
-            fila_ancha = RECUADROS_FOTO[-1]["fila"] + desplazamiento
-            res.append((fila_ancha + (i - len(RECUADROS_FOTO) + 1),
-                        FOTO_ADICIONAL["col_ini"], FOTO_ADICIONAL["col_fin"]))
-    return res
+ALTO_MAX_FILA_PX = 545          # Excel no permite filas de más de 409 pt (= 545 px)
 
 
-def _crear_filas_fotos_extra(ws, n_extra: int, fila_ancha: int) -> None:
-    """Agrega filas del mismo tamaño y formato que el recuadro ancho (B30:G30)."""
-    for k in range(1, n_extra + 1):
-        fila = fila_ancha + k
-        _copiar_estilo_fila(ws, fila_ancha, fila)
-        ws.merge_cells(f"B{fila}:G{fila}")
+def _colocar_imagen(ws, jpeg: bytes, fila: int, col_ini: str, off_x: int, off_y: int, w: int, h: int) -> None:
+    col = column_index_from_string(col_ini)
+    while off_x >= _px_columna(ws, get_column_letter(col)):
+        off_x -= _px_columna(ws, get_column_letter(col))
+        col += 1
+    img = XLImage(io.BytesIO(jpeg))
+    img.width, img.height = w, h
+    marcador = AnchorMarker(col=col - 1, colOff=pixels_to_EMU(off_x), row=fila - 1, rowOff=pixels_to_EMU(off_y))
+    img.anchor = OneCellAnchor(_from=marcador, ext=XDRPositiveSize2D(pixels_to_EMU(w), pixels_to_EMU(h)))
+    ws.add_image(img)
+
+
+def _colocar_fotos_anchas(ws, jpegs: list, fila_inicio: int) -> int:
+    """Fotos 3 en adelante: cada una ocupa TODO el ancho B:G y la fila toma el alto que
+    necesita la foto (sin recortarla). Si pasa el máximo de Excel por fila, la foto
+    ocupa 2 o más filas combinadas. Devuelve cuántas se insertaron."""
+    ancho_caja = sum(_px_columna(ws, get_column_letter(c)) for c in
+                     range(column_index_from_string(FOTO_ADICIONAL["col_ini"]),
+                           column_index_from_string(FOTO_ADICIONAL["col_fin"]) + 1))
+    ancho_foto = ancho_caja - 2 * MARGEN_FOTO_PX
+    if not jpegs:
+        return 0
+    for r in [r for r in ws.merged_cells.ranges if r.min_row == fila_inicio and r.min_col == 2]:
+        ws.merged_cells.remove(r)                      # B30:G30 se vuelve a combinar a la medida
+    fila, insertadas = fila_inicio, 0
+    for jpeg in jpegs:
+        try:
+            with PILImage.open(io.BytesIO(jpeg)) as im:
+                iw, ih = im.size
+            alto_foto = max(1, round(ancho_foto * ih / iw))
+            total = alto_foto + 2 * MARGEN_FOTO_PX
+            n_filas = -(-total // ALTO_MAX_FILA_PX)          # división hacia arriba
+            alto_fila_pt = round(total / n_filas * 72 / 96 + 0.75, 2)
+            for f in range(fila, fila + n_filas):
+                if f != fila_inicio:
+                    _copiar_estilo_fila(ws, fila_inicio, f)
+                ws.row_dimensions[f].height = alto_fila_pt
+            ws.merge_cells(f"{FOTO_ADICIONAL['col_ini']}{fila}:{FOTO_ADICIONAL['col_fin']}{fila + n_filas - 1}")
+            _colocar_imagen(ws, jpeg, fila, FOTO_ADICIONAL["col_ini"], MARGEN_FOTO_PX, MARGEN_FOTO_PX,
+                            ancho_foto, alto_foto)
+            fila += n_filas
+            insertadas += 1
+        except Exception as e:
+            logger.error(f"No se pudo insertar una foto en la fila {fila}: {e}")
+    return insertadas
 
 
 def _colocar_foto(ws, jpeg: bytes, fila: int, col_ini: str, col_fin: str) -> None:
@@ -326,17 +359,7 @@ def _colocar_foto(ws, jpeg: bytes, fila: int, col_ini: str, col_fin: str) -> Non
     off_x = MARGEN_FOTO_PX + (caja_w - w) // 2
     off_y = MARGEN_FOTO_PX + (caja_h - h) // 2
 
-    # El desplazamiento horizontal se expresa como columna + resto dentro de ella
-    col = column_index_from_string(col_ini)
-    while off_x >= _px_columna(ws, get_column_letter(col)) and col < column_index_from_string(col_fin):
-        off_x -= _px_columna(ws, get_column_letter(col))
-        col += 1
-
-    img = XLImage(io.BytesIO(jpeg))
-    img.width, img.height = w, h
-    marcador = AnchorMarker(col=col - 1, colOff=pixels_to_EMU(off_x), row=fila - 1, rowOff=pixels_to_EMU(off_y))
-    img.anchor = OneCellAnchor(_from=marcador, ext=XDRPositiveSize2D(pixels_to_EMU(w), pixels_to_EMU(h)))
-    ws.add_image(img)
+    _colocar_imagen(ws, jpeg, fila, col_ini, off_x, off_y, w, h)
 
 
 # --------------------------------------------------------------------------
@@ -378,16 +401,15 @@ def _armar_excel(plantilla: bytes, valores: dict, imagenes_jpeg: list) -> tuple:
     _ajustar_impresion(ws)
 
     validas = [j for j in imagenes_jpeg if j]
-    recuadros = _recuadros_para(len(validas), desplazamiento)
-    n_extra = max(0, len(validas) - len(RECUADROS_FOTO))
-    _crear_filas_fotos_extra(ws, n_extra, RECUADROS_FOTO[-1]["fila"] + desplazamiento)
+    n_arriba = len(RECUADROS_FOTO) - 1                 # fotos 1 y 2 (B28:D28 y E28:G28)
     insertadas = 0
-    for jpeg, (fila, ci, cf) in zip(validas, recuadros):
+    for jpeg, r in zip(validas[:n_arriba], RECUADROS_FOTO[:n_arriba]):
         try:
-            _colocar_foto(ws, jpeg, fila, ci, cf)
+            _colocar_foto(ws, jpeg, r["fila"] + desplazamiento, r["col_ini"], r["col_fin"])
             insertadas += 1
         except Exception as e:
-            logger.error(f"No se pudo insertar una foto en la fila {fila}: {e}")
+            logger.error(f"No se pudo insertar una foto en la fila {r['fila']}: {e}")
+    insertadas += _colocar_fotos_anchas(ws, validas[n_arriba:], RECUADROS_FOTO[-1]["fila"] + desplazamiento)
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -412,8 +434,11 @@ def generar_reporte_byd(valores: dict, imagenes: list, ediciones: dict = None) -
         ed = dict(ediciones.get(clave_foto(a)) or {})
         try:  # cada foto llena su recuadro completo (recorte con la forma del recuadro)
             w, h = tamano_orientado(datos, ed.get("rot", 0))
-            libre = (ed.get("ajuste") or {}).get("modo") == "libre_arrastre"
-            ed["crop"] = encuadre_relleno(w, h, ed.get("crop"), proporcion_para_indice(i), libre)
+            if alto_libre(i):          # 3ª en adelante: foto completa (o el recorte que eligió el usuario)
+                ed["crop"] = ed.get("crop")
+            else:
+                libre = (ed.get("ajuste") or {}).get("modo") == "libre_arrastre"
+                ed["crop"] = encuadre_relleno(w, h, ed.get("crop"), proporcion_para_indice(i), libre)
         except Exception as e:
             logger.warning(f"No se pudo calcular el encuadre de {a.name}: {e}")
         fotos.append((a.name, datos, ed))
