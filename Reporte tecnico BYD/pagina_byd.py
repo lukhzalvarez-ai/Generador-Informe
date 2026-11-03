@@ -878,7 +878,13 @@ if _comp_borrador is not None:
             accion, datos = "guardar", json.dumps(_b, ensure_ascii=False, default=str)
     ident = hashlib.md5(f"{accion}|{datos}|{st.session_state.get(K('n_cargador'), 0)}".encode()).hexdigest() \
         if accion else None
-    _valor = _comp_borrador(accion=accion, datos=datos, id=ident, key=K("borrador"), default=None)
+    # El borrador es invisible: se oculta su recuadro (y el aviso de Streamlit si el servidor
+    # tarda en entregarlo, p. ej. justo después de una actualización de la app).
+    st.markdown("<style>.st-key-byd_caja_borrador {position: absolute !important; width: 1px !important; "
+                "height: 1px !important; overflow: hidden !important; opacity: 0 !important; "
+                "pointer-events: none !important;}</style>", unsafe_allow_html=True)
+    with st.container(key="byd_caja_borrador"):
+        _valor = _comp_borrador(accion=accion, datos=datos, id=ident, key=K("borrador"), default=None)
     if accion == "borrar":
         st.session_state.pop(K("borrar_borrador"), None)
     if isinstance(_valor, dict) and "leido" in _valor and not st.session_state.get(K("borrador_leido")):
