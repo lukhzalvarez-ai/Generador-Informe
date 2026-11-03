@@ -41,7 +41,7 @@ from byd.archivos import (  # noqa: E402
     clasificar_archivos_subidos, clave_foto, huella, _es_imagen_valida, es_zip, expandir_zip,
 )
 from byd.imagenes import (abrir_normalizada, aplicar_edicion, calcular_encuadre, dibujar_marco,  # noqa: E402
-                          encuadre_relleno)
+                          encuadre_relleno, tamano_orientado)
 from byd.excel import (  # noqa: E402
     cargar_plantilla, generar_reporte_byd, proporcion_para_indice, nombre_recuadro,
     validar_campos_criticos, a_numero, a_fecha, alto_libre,
@@ -58,7 +58,7 @@ def K(nombre: str) -> str:
 # --------------------------------------------------------------------------
 # Caché (mismo criterio que Astara: huella rápida, bytes sin recorrer)
 # --------------------------------------------------------------------------
-@st.cache_data(show_spinner=False, max_entries=50)
+@st.cache_data(show_spinner=False, max_entries=50, ttl=7200)
 def _byd_texto_pdf(huella_archivo: str, _datos: bytes, nombre: str) -> str:
     return extraer_texto_pdf(_datos, nombre)
 
@@ -76,7 +76,7 @@ def imagenes_factura(archivo) -> list:
     return _byd_factura(huella(archivo), archivo.getvalue()) if archivo is not None else []
 
 
-@st.cache_data(show_spinner=False, max_entries=500)
+@st.cache_data(show_spinner=False, max_entries=500, ttl=7200)
 def _byd_imagen_valida(huella_archivo: str, _datos: bytes) -> bool:
     return _es_imagen_valida(_datos)
 
@@ -85,7 +85,7 @@ def imagen_valida_cache(archivo) -> bool:
     return _byd_imagen_valida(huella(archivo), archivo.getvalue())
 
 
-@st.cache_data(show_spinner=False, max_entries=600)
+@st.cache_data(show_spinner=False, max_entries=300, ttl=3600)
 def _byd_miniatura(huella_archivo: str, rot: int, crop, lado: int, _datos: bytes) -> bytes:
     img = abrir_normalizada(_datos, lado, {"rot": rot, "crop": crop})
     buffer = io.BytesIO()
@@ -97,16 +97,27 @@ def miniatura_jpeg(archivo, rot: int, crop, lado: int) -> bytes:
     return _byd_miniatura(huella(archivo), rot, tuple(crop) if crop else None, lado, archivo.getvalue())
 
 
-@st.cache_data(show_spinner=False, max_entries=300)
+# Imagen grande (~1 MB en memoria cada una): pocas y por poco tiempo, solo para el recortador.
+@st.cache_data(show_spinner=False, max_entries=12, ttl=1800)
 def _byd_base_editor(huella_archivo: str, rot: int, _datos: bytes):
     return abrir_normalizada(_datos, 700, {"rot": rot})
+
+
+@st.cache_data(show_spinner=False, max_entries=2000, ttl=7200)
+def _byd_tamano(huella_archivo: str, rot: int, _datos: bytes) -> tuple:
+    return tamano_orientado(_datos, rot)
+
+
+def tamano_foto(archivo, rot: int) -> tuple:
+    """Ancho/alto de la foto como se ve (lee solo la cabecera: no la abre entera)."""
+    return _byd_tamano(huella(archivo), rot, archivo.getvalue())
 
 
 def base_editor(archivo, rot: int):
     return _byd_base_editor(huella(archivo), rot, archivo.getvalue())
 
 
-@st.cache_data(show_spinner=False, max_entries=100)
+@st.cache_data(show_spinner=False, max_entries=12, ttl=1800)
 def _byd_data_url(huella_archivo: str, rot: int, _datos: bytes) -> str:
     img = _byd_base_editor(huella_archivo, rot, _datos)
     buffer = io.BytesIO()
@@ -484,7 +495,7 @@ def encuadrar_todas(archivos: list) -> None:
         if ed.get("crop"):
             continue
         try:
-            w, h = base_editor(archivo, ed.get("rot", 0)).size
+            w, h = tamano_foto(archivo, ed.get("rot", 0))
         except Exception:
             continue
         ed["crop"] = calcular_encuadre(w, h, proporcion=proporcion_para_indice(i))
@@ -498,7 +509,7 @@ def crop_en_informe(archivo, indice: int, ed: dict):
     if alto_libre(indice):
         return ed.get("crop")
     try:
-        w, h = base_editor(archivo, ed.get("rot", 0)).size
+        w, h = tamano_foto(archivo, ed.get("rot", 0))
     except Exception:
         return ed.get("crop")
     libre = (ed.get("ajuste") or {}).get("modo") == "libre_arrastre"

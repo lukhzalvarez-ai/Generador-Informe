@@ -49,7 +49,7 @@ from reporte.componentes import (recortador as componente_recortador, ordenador 
 # de su contenido). Los bytes van en parámetros con "_" para que Streamlit
 # NO los recorra completos al buscar en la caché.
 # --------------------------------------------------------------------------
-@st.cache_data(show_spinner=False, max_entries=50)
+@st.cache_data(show_spinner=False, max_entries=50, ttl=7200)
 def _texto_pdf(huella_archivo: str, _datos: bytes, nombre: str) -> str:
     return extraer_texto_pdf(_datos, nombre)
 
@@ -58,7 +58,7 @@ def leer_pdf_cache(archivo) -> str:
     return _texto_pdf(huella(archivo), archivo.getvalue(), archivo.name)
 
 
-@st.cache_data(show_spinner=False, max_entries=500)
+@st.cache_data(show_spinner=False, max_entries=500, ttl=7200)
 def _imagen_valida(huella_archivo: str, _datos: bytes) -> bool:
     return _es_imagen_valida(_datos)
 
@@ -67,7 +67,7 @@ def imagen_valida_cache(archivo) -> bool:
     return _imagen_valida(huella(archivo), archivo.getvalue())
 
 
-@st.cache_data(show_spinner=False, max_entries=600)
+@st.cache_data(show_spinner=False, max_entries=300, ttl=3600)
 def _miniatura(huella_archivo: str, rot: int, crop, lado: int, _datos: bytes) -> bytes:
     img = abrir_normalizada(_datos, lado, {"rot": rot, "crop": crop})
     buffer = io.BytesIO()
@@ -79,7 +79,8 @@ def miniatura_jpeg(archivo, rot: int, crop, lado: int) -> bytes:
     return _miniatura(huella(archivo), rot, tuple(crop) if crop else None, lado, archivo.getvalue())
 
 
-@st.cache_data(show_spinner=False, max_entries=300)
+# Imagen grande (~1 MB en memoria cada una): pocas y por poco tiempo, solo para el recortador.
+@st.cache_data(show_spinner=False, max_entries=12, ttl=1800)
 def _base_editor(huella_archivo: str, rot: int, _datos: bytes):
     """Versión liviana (máx. 700 px) de la foto, rotada y sin recortar, para el
     editor y para calcular encuadres."""
@@ -90,7 +91,7 @@ def base_editor(archivo, rot: int):
     return _base_editor(huella(archivo), rot, archivo.getvalue())
 
 
-@st.cache_data(show_spinner=False, max_entries=100)
+@st.cache_data(show_spinner=False, max_entries=12, ttl=1800)
 def _data_url(huella_archivo: str, rot: int, _datos: bytes) -> str:
     img = _base_editor(huella_archivo, rot, _datos)
     buffer = io.BytesIO()
