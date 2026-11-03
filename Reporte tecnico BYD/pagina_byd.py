@@ -139,10 +139,10 @@ st.markdown(
 [data-testid="stSidebar"] * { color: #FFFFFF !important; }
 [data-testid="stSidebar"] h3 { color: #FF4D6A !important; }
 [data-testid="stSidebar"] code { background: rgba(228,0,43,.18) !important; color: #FF8095 !important; }
-.byd-hero { background: #FFFFFF; padding: 1.3rem 2rem; border-radius: 12px; margin-bottom: 1.3rem;
+.byd-hero { background: #003DA5; padding: 1.3rem 2rem; border-radius: 12px; margin-bottom: 1.3rem;
             border-bottom: 6px solid var(--byd-red); box-shadow: 0 10px 28px rgba(0,0,0,.35); }
-.byd-hero h1 { color: var(--byd-red) !important; margin: 0; font-size: 2rem; font-weight: 800; }
-.byd-hero p { color: #333333 !important; margin: .35rem 0 0 0; }
+.stApp .byd-hero h1, .stApp .byd-hero h1 * { color: #FFFFFF !important; margin: 0; font-size: 2rem; font-weight: 800; }
+.stApp .byd-hero p { color: #DCE6F7 !important; margin: .35rem 0 0 0; }
 .byd-badge { display: inline-block; background: var(--byd-surface); color: var(--byd-text) !important;
              border: 1.5px solid var(--byd-border); border-radius: 999px; padding: 3px 12px;
              font-size: .8rem; font-weight: 600; margin: 0 6px 6px 0; }
