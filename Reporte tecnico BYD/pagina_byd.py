@@ -129,18 +129,18 @@ def expandir_subidos(archivos: list) -> tuple:
 st.markdown(
     """
 <style>
-:root { --byd-red: #E4002B; --byd-red-dark: #B00020; --byd-bg: #16181C; --byd-surface: #23262B;
+:root { --byd-line: #C1CAC9; --byd-red: #E4002B; --byd-red-dark: #B00020; --byd-bg: #16181C; --byd-surface: #23262B;
         --byd-border: #3C4048; --byd-text: #F1F1F1; }
 .stApp { background: linear-gradient(180deg, #2B2E33 0px, #2B2E33 210px, var(--byd-bg) 210px); color: var(--byd-text); }
 [data-testid="stHeader"] { background: transparent; }
 .stApp p, .stApp li, .stApp label, .stApp span, .stApp h1, .stApp h2, .stApp h3, .stApp h4,
 [data-testid="stMarkdownContainer"] { color: var(--byd-text); }
-[data-testid="stSidebar"] { background: #1E2024; border-right: 4px solid var(--byd-red); }
+[data-testid="stSidebar"] { background: #1E2024; border-right: 4px solid var(--byd-line); }
 [data-testid="stSidebar"] * { color: #FFFFFF !important; }
 [data-testid="stSidebar"] h3 { color: #FF4D6A !important; }
 [data-testid="stSidebar"] code { background: rgba(228,0,43,.18) !important; color: #FF8095 !important; }
 .byd-hero { background: #003DA5; padding: 1.3rem 2rem; border-radius: 12px; margin-bottom: 1.3rem;
-            border-bottom: 6px solid var(--byd-red); box-shadow: 0 10px 28px rgba(0,0,0,.35); }
+            border-bottom: 6px solid var(--byd-line); box-shadow: 0 10px 28px rgba(0,0,0,.35); }
 .stApp .byd-hero h1, .stApp .byd-hero h1 * { color: #FFFFFF !important; margin: 0; font-size: 2rem; font-weight: 800; }
 .stApp .byd-hero p { color: #DCE6F7 !important; margin: .35rem 0 0 0; }
 .byd-badge { display: inline-block; background: var(--byd-surface); color: var(--byd-text) !important;
@@ -148,12 +148,12 @@ st.markdown(
              font-size: .8rem; font-weight: 600; margin: 0 6px 6px 0; }
 .byd-badge.ok { background: #2F3338; border-color: #8A9099; }
 .byd-badge.warn { background: rgba(228,0,43,.12); border-color: var(--byd-red); color: #FF8095 !important; }
-.stApp h4 { color: #FFFFFF !important; border-left: 5px solid var(--byd-red); padding-left: .6rem; }
+.stApp h4 { color: #FFFFFF !important; border-left: 5px solid var(--byd-line); padding-left: .6rem; }
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color: #B8BDC6 !important; }
-div[data-testid="stFileUploaderDropzone"] { border: 2px dashed var(--byd-red) !important; background: var(--byd-surface) !important; }
+div[data-testid="stFileUploaderDropzone"] { border: 2px dashed var(--byd-line) !important; background: var(--byd-surface) !important; }
 div[data-testid="stFileUploaderDropzone"] * { color: var(--byd-text) !important; }
 [data-testid="stForm"] { background: var(--byd-surface); border: 1px solid var(--byd-border) !important;
-                         border-top: 4px solid var(--byd-red) !important; border-radius: 12px; }
+                         border-top: 4px solid var(--byd-line) !important; border-radius: 12px; }
 [data-testid="stForm"] textarea, [data-testid="stForm"] input { background: #17191D !important; color: var(--byd-text) !important; }
 [data-testid="stForm"] label p { font-weight: 600; }
 .stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"], .stFormSubmitButton > button,
@@ -165,7 +165,7 @@ button[data-testid="stBaseButton-primaryFormSubmit"] *, button[data-testid="stBa
 button[data-testid="stBaseButton-primaryFormSubmit"]:hover, button[data-testid="stBaseButton-primary"]:hover {
     background: var(--byd-red-dark) !important; border-color: #FFFFFF !important; }
 [data-testid="stMetric"] { background: var(--byd-surface); border: 1px solid var(--byd-border);
-                           border-top: 4px solid var(--byd-red); border-radius: 10px; padding: .7rem 1rem; }
+                           border-top: 4px solid var(--byd-line); border-radius: 10px; padding: .7rem 1rem; }
 [data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color: #FF4D6A !important; }
 </style>
 """,
