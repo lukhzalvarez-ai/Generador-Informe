@@ -19,6 +19,8 @@ mezclan con los del informe Astara.
 """
 
 import io
+import json
+import hashlib
 import datetime
 import sys
 import base64
@@ -43,7 +45,8 @@ from byd.excel import (  # noqa: E402
     cargar_plantilla, generar_reporte_byd, proporcion_para_indice, nombre_recuadro,
     validar_campos_criticos, a_numero, a_fecha, alto_libre,
 )
-from byd.componentes import recortador as componente_recortador, ordenador as componente_ordenador  # noqa: E402
+from byd.componentes import (recortador as componente_recortador, ordenador as componente_ordenador,  # noqa: E402
+                             borrador as componente_borrador)
 
 
 def K(nombre: str) -> str:
@@ -216,7 +219,76 @@ def nuevo_informe() -> None:
         if str(k).startswith("byd_"):
             del st.session_state[k]
     st.session_state[K("n_cargador")] = siguiente
+    st.session_state[K("borrador_leido")] = True       # empezar de cero: el borrador anterior se borra
+    st.session_state[K("borrador_decidido")] = True
+    st.session_state[K("borrar_borrador")] = True
 
+
+# --------------------------------------------------------------------------
+# Borrador: si la página se recargó o se perdió la conexión, se ofrece recuperar
+# lo último que se estaba haciendo (se guarda solo en este navegador).
+# --------------------------------------------------------------------------
+def recuperar_borrador() -> None:
+    encontrado = st.session_state.pop(K("borrador_encontrado"), None) or {}
+    st.session_state[K("borrador_decidido")] = True
+    try:
+        d = json.loads(encontrado.get("datos") or "{}")
+    except Exception:
+        return
+    for campo, v in (d.get("campos") or {}).items():
+        if campo in CAMPOS_FECHA_BORRADOR:
+            try:
+                v = datetime.date.fromisoformat(v) if v else None
+            except ValueError:
+                v = None
+        st.session_state[K(f"campo_{campo}")] = v
+    for nombre, (cols, clave_df, clave_ed) in TABLAS_BORRADOR.items():
+        filas = (d.get("tablas") or {}).get(nombre)
+        if filas is not None:
+            df = pd.DataFrame(filas, columns=list(cols.values())).fillna("").astype(str)
+            st.session_state[K(clave_df)] = df
+            st.session_state.pop(K(clave_ed), None)
+    fotos = d.get("fotos") or {}
+    st.session_state[K("ediciones")] = {
+        k: {"rot": e.get("rot", 0), "crop": tuple(e["crop"]) if e.get("crop") else None, "ajuste": e.get("ajuste")}
+        for k, e in (fotos.get("ediciones") or {}).items()}
+    st.session_state[K("orden_preferido")] = fotos.get("orden") or []
+    st.session_state[K("excl_preferido")] = fotos.get("excluidas") or {}
+    if d.get("firma_pdfs"):
+        st.session_state[K("firma_pdfs")] = d["firma_pdfs"]
+    st.session_state[K("archivos_por_adjuntar")] = d.get("archivos") or []
+
+
+def descartar_borrador() -> None:
+    st.session_state.pop(K("borrador_encontrado"), None)
+    st.session_state[K("borrador_decidido")] = True
+    st.session_state[K("borrar_borrador")] = True
+
+
+CAMPOS_FECHA_BORRADOR = ("sales_date", "delivery_date", "service_date")
+
+_encontrado = st.session_state.get(K("borrador_encontrado"))
+if _encontrado:
+    try:
+        _d = json.loads(_encontrado.get("datos") or "{}")
+    except Exception:
+        _d = {}
+    _num = ((_d.get("campos") or {}).get("report_number") or "").strip()
+    _arch = _d.get("archivos") or []
+    with st.container(border=True):
+        st.markdown(f"##### 📝 Hay un borrador sin terminar ({_encontrado.get('t', '')})")
+        st.caption((f"Report Number **{_num}** · " if _num else "") +
+                   f"{len(_arch)} archivo(s) adjuntos en ese momento. Se recuperan los textos, fechas, "
+                   "tablas y el orden/recortes de las fotos; los archivos se vuelven a adjuntar.")
+        b1, b2, _ = st.columns([1.3, 1, 3])
+        b1.button("↩️ Recuperar borrador", type="primary", on_click=recuperar_borrador,
+                  use_container_width=True, key=K("recuperar_borrador"))
+        b2.button("Descartar", on_click=descartar_borrador, use_container_width=True, key=K("descartar_borrador"))
+
+_por_adjuntar = st.session_state.get(K("archivos_por_adjuntar"))
+if _por_adjuntar:
+    st.info("📎 Borrador recuperado. Vuelve a adjuntar estos archivos (las fotos retoman su orden y "
+            "recortes al subirlas): " + ", ".join(f"`{n}`" for n in _por_adjuntar))
 
 _col_carga, _col_reset = st.columns([5, 1])
 with _col_reset:
@@ -238,6 +310,10 @@ with _col_carga:
         key=K(f"cargador_{st.session_state.get(K('n_cargador'), 0)}"),
     )
 
+if archivos_subidos and _por_adjuntar:
+    _subidos = {a.name for a in archivos_subidos}
+    if all(n in _subidos for n in _por_adjuntar):
+        st.session_state.pop(K("archivos_por_adjuntar"), None)
 archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(archivos_subidos or [])
 clasificacion = clasificar_archivos_subidos(archivos_expandidos, leer_pdf=leer_pdf_cache,
                                              es_imagen=imagen_valida_cache)
@@ -252,8 +328,18 @@ def _sincronizar_fotos(imagenes: list) -> tuple:
     por_clave = {clave_foto(a): a for a in imagenes}
     orden = [c for c in st.session_state.get(K("orden_fotos"), []) if c in por_clave]
     orden += [c for c in por_clave if c not in orden]
-    st.session_state[K("orden_fotos")] = orden
     excluidas = st.session_state.setdefault(K("fotos_excluidas"), {})
+    preferido = st.session_state.get(K("orden_preferido"))       # orden que trae un borrador recuperado
+    if preferido:
+        orden = [c for c in preferido if c in por_clave] + [c for c in orden if c not in preferido]
+        excl_pref = st.session_state.get(K("excl_preferido"), {})
+        for c in list(excl_pref):
+            if c in por_clave:
+                excluidas[c] = excl_pref.pop(c)
+        if all(c in por_clave for c in preferido):
+            st.session_state.pop(K("orden_preferido"), None)
+            st.session_state.pop(K("excl_preferido"), None)
+    st.session_state[K("orden_fotos")] = orden
     for c in list(excluidas):
         if c not in por_clave:
             del excluidas[c]
@@ -278,6 +364,7 @@ def _claves_incluidas() -> list:
 
 
 def _guardar_orden(incluidas: list) -> None:
+    st.session_state.pop(K("orden_preferido"), None)       # el usuario ya eligió el orden
     excl = st.session_state.get(K("fotos_excluidas"), {})
     resto = [c for c in st.session_state.get(K("orden_fotos"), []) if c in excl]
     st.session_state[K("orden_fotos")] = incluidas + resto
@@ -648,8 +735,12 @@ if K("df_piezas") not in st.session_state:
     st.session_state[K("df_mo")] = _tabla_vacia(COLS_MO, 3)
     st.session_state[K("df_rep")] = _tabla_vacia(COLS_REP, 3)
 
-firma_pdfs = hash((clasificacion["pdf_orden"] or "", clasificacion["pdf_garantias"] or ""))
-if st.session_state.get(K("firma_pdfs")) != firma_pdfs:
+firma_pdfs = hashlib.md5(((clasificacion["pdf_orden"] or "") + "\x00" +
+                          (clasificacion["pdf_garantias"] or "")).encode("utf-8")).hexdigest()
+HAY_PDFS = bool(clasificacion["pdf_orden"] or clasificacion["pdf_garantias"])
+# Se vuelve a leer de los PDF solo si cambiaron (y hay alguno): quitar los PDF o recuperar un
+# borrador sin volver a adjuntarlos no borra lo que ya está escrito.
+if HAY_PDFS and st.session_state.get(K("firma_pdfs")) != firma_pdfs:
     cargar_lo_leido(VALORES_PDF)
     st.session_state[K("firma_pdfs")] = firma_pdfs
 
@@ -661,9 +752,10 @@ with col_btn:
               use_container_width=True, key=K("recargar_pdf"),
               help="Vuelve a poner lo que se leyó de los PDF. No borra lo que escribiste a mano.")
 st.caption("📄 = se lee de los PDF (texto tal cual, puedes corregirlo) · ✍️ = se llena a mano "
-           "(no viene en los PDF). Lo escrito a mano se conserva aunque cambies los PDF.")
+           "(no viene en los PDF). Lo escrito a mano se conserva aunque cambies los PDF. "
+           "💾 Todo se guarda solo como borrador en este navegador.")
 
-with st.form(K("form"), border=True):
+with st.container(border=True):
     st.markdown("**✍️ Datos a mano**")
     m1, m2, m3 = st.columns(3)
     m1.text_input(f"✍️ {ETIQUETAS['report_number']}", key=K("campo_report_number"))
@@ -698,7 +790,64 @@ with st.form(K("form"), border=True):
     ed_rep = st.data_editor(st.session_state[K("df_rep")], num_rows="dynamic", hide_index=True,
                             use_container_width=True, key=K("ed_rep"))
 
-    generar = st.form_submit_button("⚙️ Generar Service Report BYD", type="primary", use_container_width=True)
+    generar = st.button("⚙️ Generar Service Report BYD", type="primary", use_container_width=True,
+                        key=K("generar"))
+
+
+# --------------------------------------------------------------------------
+# Guardado automático del borrador (solo la última sesión, en este navegador)
+# --------------------------------------------------------------------------
+TABLAS_BORRADOR = {"piezas": (COLS_PIEZA, "df_piezas", "ed_piezas"),
+                   "mo": (COLS_MO, "df_mo", "ed_mo"),
+                   "rep": (COLS_REP, "df_rep", "ed_rep")}
+
+
+def _armar_borrador(tablas: dict) -> dict:
+    campos = {}
+    for campo in CELDAS:
+        v = st.session_state.get(K(f"campo_{campo}"))
+        campos[campo] = v.isoformat() if isinstance(v, datetime.date) else (v or "")
+    filas = {n: pd.DataFrame(df).fillna("").astype(str).values.tolist() for n, df in tablas.items()}
+    ediciones = {k: {"rot": e.get("rot", 0), "crop": list(e["crop"]) if e.get("crop") else None,
+                     "ajuste": e.get("ajuste")} for k, e in EDICIONES.items() if e.get("rot") or e.get("crop")}
+    excluidas = {k: v for k, v in st.session_state.get(K("fotos_excluidas"), {}).items()
+                 if not str(v).startswith("duplicada")}
+    return {"v": 1, "campos": campos, "tablas": filas, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
+            "archivos": [a.name for a in (archivos_subidos or [])],
+            "fotos": {"orden": st.session_state.get(K("orden_fotos"), []), "excluidas": excluidas,
+                      "ediciones": ediciones}}
+
+
+def _tiene_contenido(d: dict) -> bool:
+    c = d["campos"]
+    escrito = any(v for k, v in c.items() if k != "country") or c.get("country") not in ("", PAIS_POR_DEFECTO)
+    tablas = any(x.strip() for filas in d["tablas"].values() for fila in filas for x in fila)
+    return bool(escrito or tablas or d["archivos"])
+
+
+_comp_borrador = componente_borrador()
+if _comp_borrador is not None:
+    accion, datos = None, None
+    if st.session_state.get(K("borrar_borrador")):
+        accion = "borrar"
+    elif st.session_state.get(K("borrador_leido")) and not st.session_state.get(K("borrador_encontrado")):
+        _b = _armar_borrador({"piezas": ed_piezas, "mo": ed_mo, "rep": ed_rep})
+        if _tiene_contenido(_b):
+            accion, datos = "guardar", json.dumps(_b, ensure_ascii=False, default=str)
+    ident = hashlib.md5(f"{accion}|{datos}|{st.session_state.get(K('n_cargador'), 0)}".encode()).hexdigest() \
+        if accion else None
+    _valor = _comp_borrador(accion=accion, datos=datos, id=ident, key=K("borrador"), default=None)
+    if accion == "borrar":
+        st.session_state.pop(K("borrar_borrador"), None)
+    if isinstance(_valor, dict) and "leido" in _valor and not st.session_state.get(K("borrador_leido")):
+        st.session_state[K("borrador_leido")] = True
+        try:
+            _guardado = json.loads(_valor["leido"]) if _valor["leido"] else None
+        except Exception:
+            _guardado = None
+        if _guardado and _guardado.get("datos") and not st.session_state.get(K("borrador_decidido")):
+            st.session_state[K("borrador_encontrado")] = _guardado
+        st.rerun()
 
 if generar:
     valores = {}
