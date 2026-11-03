@@ -40,8 +40,8 @@ from reporte.imagenes import (
     abrir_normalizada, aplicar_edicion, calcular_celda_imagen, calcular_encuadre, dibujar_marco,
 )
 from reporte.excel import cargar_plantilla_predeterminada, generar_reporte
-from reporte.componentes import (recortador as componente_recortador, ordenador as componente_ordenador,
-                                 borrador as componente_borrador)
+from reporte.componentes import recortador as componente_recortador, ordenador as componente_ordenador
+from reporte import borrador as bor
 
 
 # --------------------------------------------------------------------------
@@ -370,7 +370,11 @@ def recuperar_borrador() -> None:
     st.session_state["excl_preferido"] = fotos.get("excluidas") or {}
     if d.get("firma_pdfs"):
         st.session_state["firma_pdfs"] = d["firma_pdfs"]
-    st.session_state["archivos_por_adjuntar"] = d.get("archivos") or []
+    st.session_state["archivos_por_adjuntar"] = bor.iniciar_recuperacion(K, d)
+
+
+def K(nombre: str) -> str:          # claves de sesión del borrador (Astara: sin prefijo)
+    return nombre
 
 
 def descartar_borrador() -> None:
@@ -390,17 +394,20 @@ if _encontrado:
     with st.container(border=True):
         st.markdown(f"##### 📝 Hay un borrador sin terminar ({_encontrado.get('t', '')})")
         st.caption((f"VIN **{_vin}** · " if _vin else "") +
-                   f"{len(_arch)} archivo(s) adjuntos en ese momento. Se recuperan los textos y el "
-                   "orden/recortes de las fotos; los archivos se vuelven a adjuntar.")
+                   f"{len(_arch)} archivo(s). Se recuperan los textos, los PDF, las fotos y su "
+                   "orden/recortes, sin volver a adjuntarlos.")
         b1, b2, _ = st.columns([1.3, 1, 3])
         b1.button("↩️ Recuperar borrador", type="primary", on_click=recuperar_borrador,
                   use_container_width=True, key="recuperar_borrador")
         b2.button("Descartar", on_click=descartar_borrador, use_container_width=True, key="descartar_borrador")
 
+_progreso = bor.restaurando(K)
+if _progreso:
+    st.info(f"⏳ Recuperando los archivos del borrador… {_progreso[0]}/{_progreso[1]}")
 _por_adjuntar = st.session_state.get("archivos_por_adjuntar")
-if _por_adjuntar:
-    st.info("📎 Borrador recuperado. Vuelve a adjuntar estos archivos (las fotos retoman su orden y "
-            "recortes al subirlas): " + ", ".join(f"`{n}`" for n in _por_adjuntar))
+if _por_adjuntar and not _progreso:
+    st.info("📎 Estos archivos no estaban en el borrador; vuelve a adjuntarlos (las fotos retoman su "
+            "orden y recortes al subirlas): " + ", ".join(f"`{n}`" for n in _por_adjuntar))
 
 _col_carga, _col_reset = st.columns([5, 1])
 with _col_reset:
@@ -429,7 +436,15 @@ if archivos_subidos and _por_adjuntar:
     _subidos = {a.name for a in archivos_subidos}
     if all(n in _subidos for n in _por_adjuntar):
         st.session_state.pop("archivos_por_adjuntar", None)
-archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(archivos_subidos or [])
+_recuperados = bor.archivos_recuperados(K)
+if _recuperados:
+    _c1, _c2 = st.columns([5, 1])
+    _c1.caption(f"📂 {len(_recuperados)} archivo(s) recuperados del borrador (no aparecen en el cuadro de "
+                "arriba, pero se usan igual).")
+    _c2.button("Quitarlos", on_click=bor.quitar_recuperados, args=(K,), key="quitar_recuperados",
+               use_container_width=True)
+archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(
+    bor.para_procesar(K, archivos_subidos))
 clasificacion = clasificar_archivos_subidos(archivos_expandidos, leer_pdf=leer_pdf_cache,
                                              es_imagen=imagen_valida_cache)
 clasificacion["ignorados"] += IGNORADOS_EN_ZIP
@@ -842,7 +857,7 @@ for _campo in CELDAS_EXCEL:
         st.session_state[f"campo_{_campo}"] = valores_pdf.get(_campo, "") or ""
 # Se vuelve a leer de los PDF solo si cambiaron (y hay alguno): quitar los PDF o recuperar un
 # borrador sin volver a adjuntarlos no borra lo que ya está escrito.
-if HAY_PDFS and st.session_state.get("firma_pdfs") != firma_pdfs:
+if HAY_PDFS and not bor.restaurando(K) and st.session_state.get("firma_pdfs") != firma_pdfs:
     cargar_en_formulario(valores_pdf)
     st.session_state["firma_pdfs"] = firma_pdfs
 
@@ -889,41 +904,29 @@ with st.container(border=True):
 # --------------------------------------------------------------------------
 # Guardado automático del borrador (solo la última sesión, en este navegador)
 # --------------------------------------------------------------------------
-def _armar_borrador() -> dict:
+def _armar_borrador():
     campos = {c: st.session_state.get(f"campo_{c}", "") or "" for c in CELDAS_EXCEL}
+    if not (any(campos.values()) or archivos_expandidos):
+        return None
     ediciones = {k: {"rot": e.get("rot", 0), "crop": list(e["crop"]) if e.get("crop") else None,
                      "ajuste": e.get("ajuste")} for k, e in EDICIONES.items() if e.get("rot") or e.get("crop")}
     excluidas = {k: v for k, v in st.session_state.get("fotos_excluidas", {}).items()
                  if not str(v).startswith("duplicada")}
-    return {"v": 1, "campos": campos, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
-            "archivos": [a.name for a in (archivos_subidos or [])],
+    return {"v": 2, "campos": campos, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
+            "archivos": [a.name for a in archivos_expandidos],
             "fotos": {"orden": st.session_state.get("orden_fotos", []), "excluidas": excluidas,
                       "ediciones": ediciones}}
 
 
-_comp_borrador = componente_borrador()
+def _archivos_a_guardar() -> list:
+    """Los 2 PDF reconocidos y todas las fotos (también las dejadas fuera)."""
+    pdfs = {clasificacion.get("pdf_orden_nombre"), clasificacion.get("pdf_garantias_nombre")} - {"", None}
+    return [a for a in archivos_expandidos if a.name in pdfs] + list(clasificacion["imagenes"])
+
+
+_comp_borrador = bor.componente("astara_reporte_falla")
 if _comp_borrador is not None:
-    accion, datos = None, None
-    if st.session_state.get("borrar_borrador"):
-        accion = "borrar"
-    elif st.session_state.get("borrador_leido") and not st.session_state.get("borrador_encontrado"):
-        _b = _armar_borrador()
-        if any(_b["campos"].values()) or _b["archivos"]:
-            accion, datos = "guardar", json.dumps(_b, ensure_ascii=False, default=str)
-    ident = hashlib.md5(f"{accion}|{datos}|{st.session_state.get('n_cargador', 0)}".encode()).hexdigest() \
-        if accion else None
-    _valor = _comp_borrador(accion=accion, datos=datos, id=ident, key="astara_borrador", default=None)
-    if accion == "borrar":
-        st.session_state.pop("borrar_borrador", None)
-    if isinstance(_valor, dict) and "leido" in _valor and not st.session_state.get("borrador_leido"):
-        st.session_state["borrador_leido"] = True
-        try:
-            _guardado = json.loads(_valor["leido"]) if _valor["leido"] else None
-        except Exception:
-            _guardado = None
-        if _guardado and _guardado.get("datos") and not st.session_state.get("borrador_decidido"):
-            st.session_state["borrador_encontrado"] = _guardado
-        st.rerun()
+    bor.sincronizar(_comp_borrador, K, _armar_borrador, _archivos_a_guardar(), key="astara_borrador")
 
 if generar:
     valores = {campo: (st.session_state.get(f"campo_{campo}", "") or "").strip() for campo in CELDAS_EXCEL}
