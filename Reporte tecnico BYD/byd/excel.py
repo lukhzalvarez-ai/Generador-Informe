@@ -25,7 +25,7 @@ from PIL import Image as PILImage
 from .config import (logger, MB, CELDAS, CAMPOS_TEXTO_LARGO, CAMPOS_CRITICOS, TEMPLATE_PATH,
                      CAMPOS_FECHA, CAMPOS_NUMERICOS,
                      TEMPLATE_FILENAME, FILAS_PIEZA_FALLA, FILAS_MANO_OBRA, FILA_REPUESTOS,
-                     FILAS_REPUESTOS_PLANTILLA, RECUADROS_FOTO, FOTO_ADICIONAL, MARGEN_FOTO_PX,
+                     FILAS_REPUESTOS_PLANTILLA, PROPORCION_FOTO_ANCHA, RECUADROS_FOTO, FOTO_ADICIONAL, MARGEN_FOTO_PX,
                      LIMITE_REPORTE_BYTES, OBJETIVO_REPORTE_BYTES)
 from .imagenes import comprimir_fotos_para_limite, encuadre_relleno, tamano_orientado
 from .archivos import clave_foto
@@ -67,12 +67,13 @@ def proporciones_recuadros() -> tuple:
     Se usa en la pantalla para que el recortador tenga la forma correcta."""
     datos = cargar_plantilla()
     if not datos:
-        return (1.25, 1.25, 2.5)
+        return (1.25, 1.25, PROPORCION_FOTO_ANCHA)
     ws = openpyxl.load_workbook(io.BytesIO(datos)).active
     res = []
-    for r in RECUADROS_FOTO:
+    for r in RECUADROS_FOTO[:-1]:
         w, h = _tamano_recuadro(ws, r["fila"], r["col_ini"], r["col_fin"])
         res.append(w / h)
+    res.append(PROPORCION_FOTO_ANCHA)      # 3ª en adelante: el alto de la fila se adapta a 3:2
     return tuple(res)
 
 
@@ -82,9 +83,10 @@ def proporcion_para_indice(indice: int) -> float:
 
 
 def alto_libre(indice: int) -> bool:
-    """Desde la 3ª foto (recuadro ancho B:G) se respeta el ANCHO de la celda y el alto de
-    la fila se adapta a la foto: no se recorta (salvo que el usuario recorte a mano)."""
-    return indice >= len(RECUADROS_FOTO) - 1
+    """(Desactivado) Antes la 3ª foto en adelante iba completa con el alto que necesitara;
+    salían demasiado largas. Ahora todas usan un recuadro fijo: la 3ª en adelante con
+    ancho B:G y formato 3:2 (PROPORCION_FOTO_ANCHA)."""
+    return False
 
 
 def nombre_recuadro(indice: int) -> tuple:

@@ -193,7 +193,7 @@ with st.sidebar:
            - **2** → *Parts Brand (Code)* (arriba derecha)
            - **3** → *Procurement Invoice* (ancha)
            - **4 en adelante** → filas nuevas a todo el ancho
-           - desde la **3**: foto completa, la fila se adapta a su alto
+           - desde la **3**: ancho completo, formato 3:2
         3. Revisa lo leído de los PDF y completa **a mano** (✍️):
            Report Number, Country, Sales Date, pieza en falla,
            mano de obra y repuestos.
@@ -483,9 +483,9 @@ else:
 if clasificacion["imagenes"]:
     st.markdown("#### 🖼️ Fotos del Service Report")
     st.caption("Orden en el informe: **1** Malfunction Point · **2** Parts Brand (Code) · "
-               "**3** Procurement Invoice · **4+** filas adicionales. Las fotos **1 y 2** llenan su recuadro "
-               "(se recortan centradas); desde la **3** van **completas, a todo el ancho**, y la fila toma el "
-               "alto de cada foto. La vista previa muestra lo que saldrá. ✂️ recortar · ↺ ↻ rotar · 🗑️ dejar fuera.")
+               "**3** Procurement Invoice · **4+** filas adicionales. Cada foto **llena su recuadro**: "
+               "la 1 y la 2 arriba; desde la **3**, a todo el ancho en formato 3:2. Se recortan centradas y la "
+               "vista previa muestra lo que saldrá; si quieres otro encuadre usa ✂️. ✂️ recortar · ↺ ↻ rotar · 🗑️ dejar fuera.")
     g2, g3, _ = st.columns([1.3, 1.3, 3.3])
     g2.button("🧹 Quitar todos los recortes", on_click=quitar_recortes_todas, args=(FOTOS_INFORME,),
               use_container_width=True, key=K("quitar_recortes"),

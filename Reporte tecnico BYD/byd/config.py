@@ -101,6 +101,9 @@ RECUADROS_FOTO = [
      "nombre": "Photo Of Parts Procurement Invoice", "ayuda": "factura de compra"},
 ]
 FOTO_ADICIONAL = {"col_ini": "B", "col_fin": "G", "nombre": "Additional photo", "ayuda": "foto adicional"}
+# Desde la 3ª foto: ancho completo B:G y alto = ancho / 1.5 (formato 3:2, la mitad de
+# alto que una foto vertical completa). La fila del Excel toma ese alto.
+PROPORCION_FOTO_ANCHA = 1.5
 MARGEN_FOTO_PX = 6             # aire entre la foto y el borde del recuadro
 
 # Forma por defecto (ancho, alto) usada por utilidades genéricas de imagen
