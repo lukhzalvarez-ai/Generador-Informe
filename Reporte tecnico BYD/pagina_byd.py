@@ -125,12 +125,12 @@ def expandir_subidos(archivos: list) -> tuple:
 
 
 # --------------------------------------------------------------------------
-# Estilo BYD (gris oscuro + azul suave; rojo BYD solo en botones y avisos)
+# Estilo BYD (gris oscuro + azules suaves y gris #C1CAC9)
 # --------------------------------------------------------------------------
 st.markdown(
     """
 <style>
-:root { --byd-line: #C1CAC9; --byd-red: #E4002B; --byd-red-dark: #B00020; --byd-bg: #16181C; --byd-surface: #23262B;
+:root { --byd-line: #C1CAC9; --byd-red: #3A62A6; --byd-red-dark: #2C4D86; --byd-bg: #16181C; --byd-surface: #23262B;
         --byd-border: #3C4048; --byd-text: #F1F1F1; }
 .stApp { background: linear-gradient(180deg, #2B2E33 0px, #2B2E33 210px, var(--byd-bg) 210px); color: var(--byd-text); }
 [data-testid="stHeader"] { background: transparent; }
@@ -148,7 +148,7 @@ st.markdown(
              border: 1.5px solid var(--byd-border); border-radius: 999px; padding: 3px 12px;
              font-size: .8rem; font-weight: 600; margin: 0 6px 6px 0; }
 .byd-badge.ok { background: #2F3338; border-color: #8A9099; }
-.byd-badge.warn { background: rgba(228,0,43,.12); border-color: var(--byd-red); color: #FF8095 !important; }
+.byd-badge.warn { background: rgba(193,202,201,.10); border-color: #C1CAC9; color: #E6ECF7 !important; }
 .stApp h4 { color: #FFFFFF !important; border-left: 5px solid var(--byd-line); padding-left: .6rem; }
 [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color: #B8BDC6 !important; }
 div[data-testid="stFileUploaderDropzone"] { border: 2px dashed var(--byd-line) !important; background: var(--byd-surface) !important; }
