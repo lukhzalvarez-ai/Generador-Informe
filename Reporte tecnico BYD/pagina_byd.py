@@ -19,6 +19,7 @@ mezclan con los del informe Astara.
 """
 
 import io
+import datetime
 import sys
 import base64
 from pathlib import Path
@@ -40,7 +41,7 @@ from byd.imagenes import (abrir_normalizada, aplicar_edicion, calcular_encuadre,
                           encuadre_relleno)
 from byd.excel import (  # noqa: E402
     cargar_plantilla, generar_reporte_byd, proporcion_para_indice, nombre_recuadro,
-    validar_campos_criticos, a_numero,
+    validar_campos_criticos, a_numero, a_fecha,
 )
 from byd.componentes import recortador as componente_recortador, ordenador as componente_ordenador  # noqa: E402
 
@@ -124,7 +125,7 @@ def expandir_subidos(archivos: list) -> tuple:
 
 
 # --------------------------------------------------------------------------
-# Estilo BYD (gris oscuro + rojo BYD)
+# Estilo BYD (gris oscuro + azul suave; rojo BYD solo en botones y avisos)
 # --------------------------------------------------------------------------
 st.markdown(
     """
@@ -138,8 +139,8 @@ st.markdown(
 [data-testid="stSidebar"] { background: #1E2024; border-right: 4px solid var(--byd-line); }
 [data-testid="stSidebar"] * { color: #FFFFFF !important; }
 [data-testid="stSidebar"] h3 { color: #FF4D6A !important; }
-[data-testid="stSidebar"] code { background: rgba(228,0,43,.18) !important; color: #FF8095 !important; }
-.byd-hero { background: #003DA5; padding: 1.3rem 2rem; border-radius: 12px; margin-bottom: 1.3rem;
+[data-testid="stSidebar"] code { background: rgba(127,168,224,.18) !important; color: #A9C6F0 !important; }
+.byd-hero { background: #3A62A6; padding: 1.3rem 2rem; border-radius: 12px; margin-bottom: 1.3rem;
             border-bottom: 6px solid var(--byd-line); box-shadow: 0 10px 28px rgba(0,0,0,.35); }
 .stApp .byd-hero h1, .stApp .byd-hero h1 * { color: #FFFFFF !important; margin: 0; font-size: 2rem; font-weight: 800; }
 .stApp .byd-hero p { color: #DCE6F7 !important; margin: .35rem 0 0 0; }
@@ -494,7 +495,7 @@ if clasificacion["imagenes"]:
 
     ordenador = componente_ordenador()
     if ordenador is not None and len(FOTOS_INFORME) > 1:
-        st.markdown("**🔀 Arrastra las fotos para cambiar el orden** · la 1 y la 2 (borde rojo) van arriba en "
+        st.markdown("**🔀 Arrastra las fotos para cambiar el orden** · la 1 y la 2 (borde azul) van arriba en "
                     "alta calidad; la 3 en el espacio de la factura")
         items, firma = [], []
         for pos, a in enumerate(FOTOS_INFORME):
@@ -601,10 +602,25 @@ def _completar_totales(repuestos: list) -> list:
 VALORES_PDF = extraer_valores_byd(clasificacion)
 
 
+CAMPOS_FECHA_AUTO = ("delivery_date", "service_date")      # se leen de los PDF pero con calendario
+CAMPOS_LEIDOS = CAMPOS_AUTO + ("fault_description", "troubleshooting", "repair_measure")
+
+
+def _a_date(valor):
+    """Texto 'dd-mm-aaaa' de los PDF -> fecha para el calendario (None si no se puede)."""
+    f = a_fecha(valor)
+    return f.date() if isinstance(f, datetime.datetime) else None
+
+
+def _valor_leido(vals: dict, campo: str):
+    v = vals.get(campo, "") or ""
+    return _a_date(v) if campo in CAMPOS_FECHA_AUTO else v
+
+
 def cargar_lo_leido(vals: dict) -> None:
     """Rellena SOLO los campos que vienen de los PDF (no toca lo escrito a mano)."""
-    for campo in CAMPOS_AUTO + ("fault_description", "troubleshooting", "repair_measure"):
-        st.session_state[K(f"campo_{campo}")] = vals.get(campo, "") or ""
+    for campo in CAMPOS_LEIDOS:
+        st.session_state[K(f"campo_{campo}")] = _valor_leido(vals, campo)
 
 
 # Campos manuales y tablas: se crean UNA vez y se conservan aunque cambien los PDF.
@@ -613,6 +629,9 @@ def cargar_lo_leido(vals: dict) -> None:
 for _campo, _defecto in (("report_number", ""), ("country", PAIS_POR_DEFECTO), ("sales_date", None)):
     if K(f"campo_{_campo}") not in st.session_state:
         st.session_state[K(f"campo_{_campo}")] = _defecto
+for _campo in CAMPOS_LEIDOS:           # si Streamlit los borró al cambiar de página, se recargan
+    if K(f"campo_{_campo}") not in st.session_state:
+        st.session_state[K(f"campo_{_campo}")] = _valor_leido(VALORES_PDF, _campo)
 if K("df_piezas") not in st.session_state:
     st.session_state[K("df_piezas")] = _tabla_vacia(COLS_PIEZA, 3)
     st.session_state[K("df_mo")] = _tabla_vacia(COLS_MO, 3)
@@ -643,7 +662,11 @@ with st.form(K("form"), border=True):
     st.markdown("**📄 Vehicle's Information (de los PDF)**")
     cols = st.columns(5)
     for i, campo in enumerate(CAMPOS_AUTO):
-        cols[i].text_input(f"📄 {ETIQUETAS[campo]}", key=K(f"campo_{campo}"))
+        if campo in CAMPOS_FECHA_AUTO:
+            cols[i].date_input(f"📄 {ETIQUETAS[campo]}", key=K(f"campo_{campo}"), format="DD-MM-YYYY",
+                               help="Se llena sola desde los PDF si viene; si no, elígela en el calendario.")
+        else:
+            cols[i].text_input(f"📄 {ETIQUETAS[campo]}", key=K(f"campo_{campo}"))
 
     st.markdown("**✍️ Malfunction Part** (máx. 3 filas)")
     ed_piezas = st.data_editor(st.session_state[K("df_piezas")], num_rows="fixed", hide_index=True,

@@ -17,12 +17,12 @@ HTML_RECORTADOR = r"""<!DOCTYPE html>
                user-select: none; -webkit-user-select: none; }
   #zona { position: relative; margin: 0 auto; overflow: hidden; touch-action: none; }
   #zona img { display: block; width: 100%; height: 100%; pointer-events: none; }
-  #caja { position: absolute; border: 2px solid #E4002B; box-sizing: border-box; cursor: move;
+  #caja { position: absolute; border: 2px solid #7FA8E0; box-sizing: border-box; cursor: move;
           box-shadow: 0 0 0 9999px rgba(0, 0, 0, .55); touch-action: none; }
-  #caja::before, #caja::after { content: ""; position: absolute; border: 0 dashed rgba(228,0,43,.6); }
+  #caja::before, #caja::after { content: ""; position: absolute; border: 0 dashed rgba(127,168,224,.6); }
   #caja::before { left: 33.3%; right: 33.3%; top: 0; bottom: 0; border-left-width: 1px; border-right-width: 1px; }
   #caja::after  { top: 33.3%; bottom: 33.3%; left: 0; right: 0; border-top-width: 1px; border-bottom-width: 1px; }
-  .esq { position: absolute; width: 18px; height: 18px; background: #E4002B; border: 2px solid #1F1F1F;
+  .esq { position: absolute; width: 18px; height: 18px; background: #7FA8E0; border: 2px solid #1F1F1F;
          border-radius: 3px; box-sizing: border-box; touch-action: none; z-index: 2; }
   .nw { left: -9px; top: -9px; cursor: nwse-resize; }   .ne { right: -9px; top: -9px; cursor: nesw-resize; }
   .sw { left: -9px; bottom: -9px; cursor: nesw-resize; } .se { right: -9px; bottom: -9px; cursor: nwse-resize; }
@@ -143,16 +143,16 @@ HTML_ORDENADOR = r"""<!DOCTYPE html>
   .item { width: 128px; background: #26292E; border: 2px solid #454A52; border-radius: 8px;
           padding: 4px; cursor: grab; position: relative; box-sizing: border-box; }
   .item:active { cursor: grabbing; }
-  .item.prio { border-color: #E4002B; }
+  .item.prio { border-color: #7FA8E0; }
   .item img { width: 100%; height: 70px; object-fit: cover; border-radius: 4px; display: block;
               pointer-events: none; }
-  .item .n { position: absolute; top: 7px; left: 7px; background: #1F1F1F; color: #E4002B;
+  .item .n { position: absolute; top: 7px; left: 7px; background: #1F1F1F; color: #7FA8E0;
              font-weight: 700; border-radius: 4px; padding: 0 6px; font-size: 13px; }
   .item .nom { color: #F2F2F2; font-size: 11px; white-space: nowrap; overflow: hidden;
                text-overflow: ellipsis; margin-top: 3px; }
   .item.arrastrando { opacity: .3; }
-  .item.antes { box-shadow: -6px 0 0 -1px #E4002B; }
-  .item.despues { box-shadow: 6px 0 0 -1px #E4002B; }
+  .item.antes { box-shadow: -6px 0 0 -1px #7FA8E0; }
+  .item.despues { box-shadow: 6px 0 0 -1px #7FA8E0; }
 </style></head>
 <body><div id="grid"></div>
 <script>
