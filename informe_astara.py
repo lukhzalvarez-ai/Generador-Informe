@@ -21,7 +21,9 @@ megas de todas las fotos.
 """
 
 import io
+import json
 import base64
+import hashlib
 
 import streamlit as st
 import pandas as pd
@@ -38,7 +40,8 @@ from reporte.imagenes import (
     abrir_normalizada, aplicar_edicion, calcular_celda_imagen, calcular_encuadre, dibujar_marco,
 )
 from reporte.excel import cargar_plantilla_predeterminada, generar_reporte
-from reporte.componentes import recortador as componente_recortador, ordenador as componente_ordenador
+from reporte.componentes import (recortador as componente_recortador, ordenador as componente_ordenador,
+                                 borrador as componente_borrador)
 
 
 # --------------------------------------------------------------------------
@@ -340,7 +343,64 @@ def nuevo_informe() -> None:
         if not str(k).startswith("byd_"):
             del st.session_state[k]
     st.session_state["n_cargador"] = siguiente
+    st.session_state["borrador_leido"] = True        # empezar de cero: el borrador anterior se borra
+    st.session_state["borrador_decidido"] = True
+    st.session_state["borrar_borrador"] = True
 
+
+# --------------------------------------------------------------------------
+# Borrador: si la página se recargó o se perdió la conexión, se ofrece recuperar
+# lo último que se estaba haciendo (se guarda solo en este navegador).
+# --------------------------------------------------------------------------
+def recuperar_borrador() -> None:
+    encontrado = st.session_state.pop("borrador_encontrado", None) or {}
+    st.session_state["borrador_decidido"] = True
+    try:
+        d = json.loads(encontrado.get("datos") or "{}")
+    except Exception:
+        return
+    for campo, v in (d.get("campos") or {}).items():
+        if campo in CELDAS_EXCEL:
+            st.session_state[f"campo_{campo}"] = v or ""
+    fotos = d.get("fotos") or {}
+    st.session_state["ediciones"] = {
+        k: {"rot": e.get("rot", 0), "crop": tuple(e["crop"]) if e.get("crop") else None, "ajuste": e.get("ajuste")}
+        for k, e in (fotos.get("ediciones") or {}).items()}
+    st.session_state["orden_preferido"] = fotos.get("orden") or []
+    st.session_state["excl_preferido"] = fotos.get("excluidas") or {}
+    if d.get("firma_pdfs"):
+        st.session_state["firma_pdfs"] = d["firma_pdfs"]
+    st.session_state["archivos_por_adjuntar"] = d.get("archivos") or []
+
+
+def descartar_borrador() -> None:
+    st.session_state.pop("borrador_encontrado", None)
+    st.session_state["borrador_decidido"] = True
+    st.session_state["borrar_borrador"] = True
+
+
+_encontrado = st.session_state.get("borrador_encontrado")
+if _encontrado:
+    try:
+        _d = json.loads(_encontrado.get("datos") or "{}")
+    except Exception:
+        _d = {}
+    _vin = ((_d.get("campos") or {}).get("vin") or "").strip()
+    _arch = _d.get("archivos") or []
+    with st.container(border=True):
+        st.markdown(f"##### 📝 Hay un borrador sin terminar ({_encontrado.get('t', '')})")
+        st.caption((f"VIN **{_vin}** · " if _vin else "") +
+                   f"{len(_arch)} archivo(s) adjuntos en ese momento. Se recuperan los textos y el "
+                   "orden/recortes de las fotos; los archivos se vuelven a adjuntar.")
+        b1, b2, _ = st.columns([1.3, 1, 3])
+        b1.button("↩️ Recuperar borrador", type="primary", on_click=recuperar_borrador,
+                  use_container_width=True, key="recuperar_borrador")
+        b2.button("Descartar", on_click=descartar_borrador, use_container_width=True, key="descartar_borrador")
+
+_por_adjuntar = st.session_state.get("archivos_por_adjuntar")
+if _por_adjuntar:
+    st.info("📎 Borrador recuperado. Vuelve a adjuntar estos archivos (las fotos retoman su orden y "
+            "recortes al subirlas): " + ", ".join(f"`{n}`" for n in _por_adjuntar))
 
 _col_carga, _col_reset = st.columns([5, 1])
 with _col_reset:
@@ -365,6 +425,10 @@ with _col_carga:
         key=f"cargador_{st.session_state.get('n_cargador', 0)}",
     )
 
+if archivos_subidos and _por_adjuntar:
+    _subidos = {a.name for a in archivos_subidos}
+    if all(n in _subidos for n in _por_adjuntar):
+        st.session_state.pop("archivos_por_adjuntar", None)
 archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(archivos_subidos or [])
 clasificacion = clasificar_archivos_subidos(archivos_expandidos, leer_pdf=leer_pdf_cache,
                                              es_imagen=imagen_valida_cache)
@@ -385,9 +449,19 @@ def _sincronizar_fotos(imagenes: list) -> tuple:
     claves = list(por_clave)
     orden = [c for c in st.session_state.get("orden_fotos", []) if c in por_clave]
     orden += [c for c in claves if c not in orden]
-    st.session_state["orden_fotos"] = orden
 
     excluidas = st.session_state.setdefault("fotos_excluidas", {})   # clave -> motivo
+    preferido = st.session_state.get("orden_preferido")       # orden que trae un borrador recuperado
+    if preferido:
+        orden = [c for c in preferido if c in por_clave] + [c for c in orden if c not in preferido]
+        excl_pref = st.session_state.get("excl_preferido", {})
+        for c in list(excl_pref):
+            if c in por_clave:
+                excluidas[c] = excl_pref.pop(c)
+        if all(c in por_clave for c in preferido):
+            st.session_state.pop("orden_preferido", None)
+            st.session_state.pop("excl_preferido", None)
+    st.session_state["orden_fotos"] = orden
     for c in list(excluidas):
         if c not in por_clave:
             del excluidas[c]
@@ -414,6 +488,7 @@ def _claves_incluidas() -> list:
 
 
 def _guardar_orden(incluidas: list) -> None:
+    st.session_state.pop("orden_preferido", None)          # el usuario ya eligió el orden
     excl = st.session_state.get("fotos_excluidas", {})
     resto = [c for c in st.session_state.get("orden_fotos", []) if c in excl]
     st.session_state["orden_fotos"] = incluidas + resto
@@ -758,8 +833,16 @@ def cargar_en_formulario(vals: dict) -> None:
 
 # Solo se recargan los campos cuando cambian los PDF; así lo que el usuario
 # escribió no se pierde al agregar o quitar fotos.
-firma_pdfs = hash((clasificacion["pdf_orden"] or "", clasificacion["pdf_garantias"] or ""))
-if st.session_state.get("firma_pdfs") != firma_pdfs:
+firma_pdfs = hashlib.md5(((clasificacion["pdf_orden"] or "") + "\x00" +
+                          (clasificacion["pdf_garantias"] or "")).encode("utf-8")).hexdigest()
+HAY_PDFS = bool(clasificacion["pdf_orden"] or clasificacion["pdf_garantias"])
+# Si Streamlit borró algún campo (pasa al cambiar de página y volver), se vuelve a leer.
+for _campo in CELDAS_EXCEL:
+    if f"campo_{_campo}" not in st.session_state:
+        st.session_state[f"campo_{_campo}"] = valores_pdf.get(_campo, "") or ""
+# Se vuelve a leer de los PDF solo si cambiaron (y hay alguno): quitar los PDF o recuperar un
+# borrador sin volver a adjuntarlos no borra lo que ya está escrito.
+if HAY_PDFS and st.session_state.get("firma_pdfs") != firma_pdfs:
     cargar_en_formulario(valores_pdf)
     st.session_state["firma_pdfs"] = firma_pdfs
 
@@ -771,10 +854,11 @@ with col_btn:
               args=(valores_pdf,), use_container_width=True)
 st.caption(
     "Los campos vienen pre-llenados con lo que se pudo leer de los PDF. "
-    "Completa o corrige aquí lo que haga falta (sin límite de caracteres) y luego genera el informe."
+    "Completa o corrige aquí lo que haga falta (sin límite de caracteres) y luego genera el informe. "
+    "💾 Todo se guarda solo como borrador en este navegador."
 )
 
-with st.form("form_reporte", border=True):
+with st.container(border=True):
     st.text_area(
         "1) ¿Cuál fue la queja del cliente?",
         key="campo_queja_cliente", height=110,
@@ -798,8 +882,48 @@ with st.form("form_reporte", border=True):
         for i, campo in enumerate(CAMPOS_DATOS_GENERALES):
             cols[i % 3].text_input(ETIQUETAS_CAMPOS[campo], key=f"campo_{campo}")
 
-    generar = st.form_submit_button("⚙️ Generar Reporte Técnico Astara", type="primary",
-                                    use_container_width=True)
+    generar = st.button("⚙️ Generar Reporte Técnico Astara", type="primary",
+                        use_container_width=True, key="generar_astara")
+
+
+# --------------------------------------------------------------------------
+# Guardado automático del borrador (solo la última sesión, en este navegador)
+# --------------------------------------------------------------------------
+def _armar_borrador() -> dict:
+    campos = {c: st.session_state.get(f"campo_{c}", "") or "" for c in CELDAS_EXCEL}
+    ediciones = {k: {"rot": e.get("rot", 0), "crop": list(e["crop"]) if e.get("crop") else None,
+                     "ajuste": e.get("ajuste")} for k, e in EDICIONES.items() if e.get("rot") or e.get("crop")}
+    excluidas = {k: v for k, v in st.session_state.get("fotos_excluidas", {}).items()
+                 if not str(v).startswith("duplicada")}
+    return {"v": 1, "campos": campos, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
+            "archivos": [a.name for a in (archivos_subidos or [])],
+            "fotos": {"orden": st.session_state.get("orden_fotos", []), "excluidas": excluidas,
+                      "ediciones": ediciones}}
+
+
+_comp_borrador = componente_borrador()
+if _comp_borrador is not None:
+    accion, datos = None, None
+    if st.session_state.get("borrar_borrador"):
+        accion = "borrar"
+    elif st.session_state.get("borrador_leido") and not st.session_state.get("borrador_encontrado"):
+        _b = _armar_borrador()
+        if any(_b["campos"].values()) or _b["archivos"]:
+            accion, datos = "guardar", json.dumps(_b, ensure_ascii=False, default=str)
+    ident = hashlib.md5(f"{accion}|{datos}|{st.session_state.get('n_cargador', 0)}".encode()).hexdigest() \
+        if accion else None
+    _valor = _comp_borrador(accion=accion, datos=datos, id=ident, key="astara_borrador", default=None)
+    if accion == "borrar":
+        st.session_state.pop("borrar_borrador", None)
+    if isinstance(_valor, dict) and "leido" in _valor and not st.session_state.get("borrador_leido"):
+        st.session_state["borrador_leido"] = True
+        try:
+            _guardado = json.loads(_valor["leido"]) if _valor["leido"] else None
+        except Exception:
+            _guardado = None
+        if _guardado and _guardado.get("datos") and not st.session_state.get("borrador_decidido"):
+            st.session_state["borrador_encontrado"] = _guardado
+        st.rerun()
 
 if generar:
     valores = {campo: (st.session_state.get(f"campo_{campo}", "") or "").strip() for campo in CELDAS_EXCEL}
