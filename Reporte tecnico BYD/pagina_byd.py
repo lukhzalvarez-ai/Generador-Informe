@@ -45,8 +45,8 @@ from byd.excel import (  # noqa: E402
     cargar_plantilla, generar_reporte_byd, proporcion_para_indice, nombre_recuadro,
     validar_campos_criticos, a_numero, a_fecha, alto_libre,
 )
-from byd.componentes import recortador as componente_recortador, ordenador as componente_ordenador  # noqa: E402
-from byd import borrador as bor  # noqa: E402
+from byd.componentes import (recortador as componente_recortador, ordenador as componente_ordenador,  # noqa: E402
+                             borrador as componente_borrador)
 
 
 def K(nombre: str) -> str:
@@ -256,7 +256,7 @@ def recuperar_borrador() -> None:
     st.session_state[K("excl_preferido")] = fotos.get("excluidas") or {}
     if d.get("firma_pdfs"):
         st.session_state[K("firma_pdfs")] = d["firma_pdfs"]
-    st.session_state[K("archivos_por_adjuntar")] = bor.iniciar_recuperacion(K, d)
+    st.session_state[K("archivos_por_adjuntar")] = d.get("archivos") or []
 
 
 def descartar_borrador() -> None:
@@ -278,20 +278,17 @@ if _encontrado:
     with st.container(border=True):
         st.markdown(f"##### 📝 Hay un borrador sin terminar ({_encontrado.get('t', '')})")
         st.caption((f"Report Number **{_num}** · " if _num else "") +
-                   f"{len(_arch)} archivo(s). Se recuperan los textos, fechas, tablas, los PDF, las fotos "
-                   "y su orden/recortes, sin volver a adjuntarlos.")
+                   f"{len(_arch)} archivo(s) adjuntos en ese momento. Se recuperan los textos, fechas, "
+                   "tablas y el orden/recortes de las fotos; los archivos se vuelven a adjuntar.")
         b1, b2, _ = st.columns([1.3, 1, 3])
         b1.button("↩️ Recuperar borrador", type="primary", on_click=recuperar_borrador,
                   use_container_width=True, key=K("recuperar_borrador"))
         b2.button("Descartar", on_click=descartar_borrador, use_container_width=True, key=K("descartar_borrador"))
 
-_progreso = bor.restaurando(K)
-if _progreso:
-    st.info(f"⏳ Recuperando los archivos del borrador… {_progreso[0]}/{_progreso[1]}")
 _por_adjuntar = st.session_state.get(K("archivos_por_adjuntar"))
-if _por_adjuntar and not _progreso:
-    st.info("📎 Estos archivos no estaban en el borrador; vuelve a adjuntarlos (las fotos retoman su "
-            "orden y recortes al subirlas): " + ", ".join(f"`{n}`" for n in _por_adjuntar))
+if _por_adjuntar:
+    st.info("📎 Borrador recuperado. Vuelve a adjuntar estos archivos (las fotos retoman su orden y "
+            "recortes al subirlas): " + ", ".join(f"`{n}`" for n in _por_adjuntar))
 
 _col_carga, _col_reset = st.columns([5, 1])
 with _col_reset:
@@ -317,15 +314,7 @@ if archivos_subidos and _por_adjuntar:
     _subidos = {a.name for a in archivos_subidos}
     if all(n in _subidos for n in _por_adjuntar):
         st.session_state.pop(K("archivos_por_adjuntar"), None)
-_recuperados = bor.archivos_recuperados(K)
-if _recuperados:
-    _c1, _c2 = st.columns([5, 1])
-    _c1.caption(f"📂 {len(_recuperados)} archivo(s) recuperados del borrador (no aparecen en el cuadro de "
-                "arriba, pero se usan igual).")
-    _c2.button("Quitarlos", on_click=bor.quitar_recuperados, args=(K,), key=K("quitar_recuperados"),
-               use_container_width=True)
-archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(
-    bor.para_procesar(K, archivos_subidos))
+archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(archivos_subidos or [])
 clasificacion = clasificar_archivos_subidos(archivos_expandidos, leer_pdf=leer_pdf_cache,
                                              es_imagen=imagen_valida_cache)
 clasificacion["ignorados"] += IGNORADOS_EN_ZIP
@@ -751,7 +740,7 @@ firma_pdfs = hashlib.md5(((clasificacion["pdf_orden"] or "") + "\x00" +
 HAY_PDFS = bool(clasificacion["pdf_orden"] or clasificacion["pdf_garantias"])
 # Se vuelve a leer de los PDF solo si cambiaron (y hay alguno): quitar los PDF o recuperar un
 # borrador sin volver a adjuntarlos no borra lo que ya está escrito.
-if HAY_PDFS and not bor.restaurando(K) and st.session_state.get(K("firma_pdfs")) != firma_pdfs:
+if HAY_PDFS and st.session_state.get(K("firma_pdfs")) != firma_pdfs:
     cargar_lo_leido(VALORES_PDF)
     st.session_state[K("firma_pdfs")] = firma_pdfs
 
@@ -823,8 +812,8 @@ def _armar_borrador(tablas: dict) -> dict:
                      "ajuste": e.get("ajuste")} for k, e in EDICIONES.items() if e.get("rot") or e.get("crop")}
     excluidas = {k: v for k, v in st.session_state.get(K("fotos_excluidas"), {}).items()
                  if not str(v).startswith("duplicada")}
-    return {"v": 2, "campos": campos, "tablas": filas, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
-            "archivos": [a.name for a in archivos_expandidos],
+    return {"v": 1, "campos": campos, "tablas": filas, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
+            "archivos": [a.name for a in (archivos_subidos or [])],
             "fotos": {"orden": st.session_state.get(K("orden_fotos"), []), "excluidas": excluidas,
                       "ediciones": ediciones}}
 
@@ -836,20 +825,29 @@ def _tiene_contenido(d: dict) -> bool:
     return bool(escrito or tablas or d["archivos"])
 
 
-def _borrador_si_hay_contenido():
-    d = _armar_borrador({"piezas": ed_piezas, "mo": ed_mo, "rep": ed_rep})
-    return d if _tiene_contenido(d) else None
-
-
-def _archivos_a_guardar() -> list:
-    """Los 2 PDF reconocidos y todas las fotos (también las dejadas fuera)."""
-    pdfs = {clasificacion.get("pdf_orden_nombre"), clasificacion.get("pdf_garantias_nombre")} - {"", None}
-    return [a for a in archivos_expandidos if a.name in pdfs] + list(clasificacion["imagenes"])
-
-
-_comp_borrador = bor.componente("byd_service_report")
+_comp_borrador = componente_borrador()
 if _comp_borrador is not None:
-    bor.sincronizar(_comp_borrador, K, _borrador_si_hay_contenido, _archivos_a_guardar(), key=K("borrador"))
+    accion, datos = None, None
+    if st.session_state.get(K("borrar_borrador")):
+        accion = "borrar"
+    elif st.session_state.get(K("borrador_leido")) and not st.session_state.get(K("borrador_encontrado")):
+        _b = _armar_borrador({"piezas": ed_piezas, "mo": ed_mo, "rep": ed_rep})
+        if _tiene_contenido(_b):
+            accion, datos = "guardar", json.dumps(_b, ensure_ascii=False, default=str)
+    ident = hashlib.md5(f"{accion}|{datos}|{st.session_state.get(K('n_cargador'), 0)}".encode()).hexdigest() \
+        if accion else None
+    _valor = _comp_borrador(accion=accion, datos=datos, id=ident, key=K("borrador"), default=None)
+    if accion == "borrar":
+        st.session_state.pop(K("borrar_borrador"), None)
+    if isinstance(_valor, dict) and "leido" in _valor and not st.session_state.get(K("borrador_leido")):
+        st.session_state[K("borrador_leido")] = True
+        try:
+            _guardado = json.loads(_valor["leido"]) if _valor["leido"] else None
+        except Exception:
+            _guardado = None
+        if _guardado and _guardado.get("datos") and not st.session_state.get(K("borrador_decidido")):
+            st.session_state[K("borrador_encontrado")] = _guardado
+        st.rerun()
 
 if generar:
     valores = {}

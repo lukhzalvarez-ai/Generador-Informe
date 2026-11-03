@@ -220,6 +220,42 @@ HTML_ORDENADOR = r"""<!DOCTYPE html>
 """
 
 
+HTML_BORRADOR = r"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head><body style="margin:0">
+<script>
+  // Borrador del Service Report BYD guardado en ESTE navegador (localStorage).
+  // Solo se guarda la última sesión: cada guardado reemplaza al anterior.
+  var CLAVE = "byd_service_report_borrador_v1";
+  var leido = false, ultimoId = null;
+  function enviar(tipo, extra) {
+    window.parent.postMessage(Object.assign({isStreamlitMessage: true, type: tipo}, extra || {}), "*");
+  }
+  function leer() { try { return window.localStorage.getItem(CLAVE); } catch (e) { return null; } }
+  window.addEventListener("message", function (ev) {
+    if (!ev.data || ev.data.type !== "streamlit:render") return;
+    var a = ev.data.args || {};
+    if (!leido) {                       // primero se lee lo que había (antes de escribir nada)
+      leido = true;
+      enviar("streamlit:setComponentValue", {dataType: "json", value: {leido: leer() || ""}});
+    }
+    if (a.id && a.id !== ultimoId) {
+      ultimoId = a.id;
+      try {
+        if (a.accion === "guardar" && a.datos) {
+          window.localStorage.setItem(CLAVE, JSON.stringify(
+            {t: new Date().toLocaleString("es-CL"), datos: a.datos}));
+        } else if (a.accion === "borrar") {
+          window.localStorage.removeItem(CLAVE);
+        }
+      } catch (e) {}
+    }
+  });
+  enviar("streamlit:componentReady", {apiVersion: 1});
+  enviar("streamlit:setFrameHeight", {height: 0});
+</script></body></html>
+"""
+
+
 @st.cache_resource(show_spinner=False)
 def declarar_componente(nombre: str, html: str):
     """Escribe el index.html de un componente propio en una carpeta temporal y
@@ -242,3 +278,6 @@ def recortador():
 def ordenador():
     return declarar_componente("byd_ordenador", HTML_ORDENADOR)
 
+
+def borrador():
+    return declarar_componente("byd_borrador", HTML_BORRADOR)
