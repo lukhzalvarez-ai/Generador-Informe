@@ -132,6 +132,13 @@ if HEIF_DISPONIBLE:
 
 NOMBRE_PDF_ORDEN = "orden de trabajo"
 NOMBRES_PDF_GARANTIAS = {"trabajo en garantias", "trabajo en garantia"}
+# Factura de compra: un PDF llamado "Factura" (también "Factura 12345", "Factura (1)"...).
+# Se convierte en imagen y va en "Photo Of Parts Procurement Invoice", a todo el ancho y
+# con su forma real (sin recortar). Si no se adjunta, el informe sale igual sin ella.
+NOMBRE_PDF_FACTURA = "factura"
+FACTURA_ANCHO_PX = 1650        # ≈ 200 dpi en hoja A4/carta: se lee bien al imprimir
+FACTURA_CALIDAD_JPEG = 85
+FACTURA_MAX_PAGINAS = 3
 
 ZIP_MAX_DESCOMPRIMIDO = 800 * MB
 ZIP_MAX_ARCHIVO = 150 * MB

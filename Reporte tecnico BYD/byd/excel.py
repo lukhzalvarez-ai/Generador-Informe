@@ -89,9 +89,12 @@ def alto_libre(indice: int) -> bool:
     return False
 
 
-def nombre_recuadro(indice: int) -> tuple:
-    """(nombre en el informe, ayuda en español) del recuadro de la foto N (0 = primera)."""
-    if indice < len(RECUADROS_FOTO):
+def nombre_recuadro(indice: int, hay_factura: bool = False) -> tuple:
+    """(nombre en el informe, ayuda en español) del recuadro de la foto N (0 = primera).
+    Si se adjuntó la factura, ella ocupa 'Procurement Invoice' y la 3ª foto pasa a adicional."""
+    if hay_factura and indice >= len(RECUADROS_FOTO) - 1:
+        r = FOTO_ADICIONAL
+    elif indice < len(RECUADROS_FOTO):
         r = RECUADROS_FOTO[indice]
     else:
         r = FOTO_ADICIONAL
@@ -367,7 +370,7 @@ def _colocar_foto(ws, jpeg: bytes, fila: int, col_ini: str, col_fin: str) -> Non
 # --------------------------------------------------------------------------
 # Armado completo
 # --------------------------------------------------------------------------
-def _armar_excel(plantilla: bytes, valores: dict, imagenes_jpeg: list) -> tuple:
+def _armar_excel(plantilla: bytes, valores: dict, imagenes_jpeg: list, facturas: tuple = ()) -> tuple:
     wb = openpyxl.load_workbook(io.BytesIO(plantilla))
     ws = wb.active
 
@@ -411,7 +414,10 @@ def _armar_excel(plantilla: bytes, valores: dict, imagenes_jpeg: list) -> tuple:
             insertadas += 1
         except Exception as e:
             logger.error(f"No se pudo insertar una foto en la fila {r['fila']}: {e}")
-    insertadas += _colocar_fotos_anchas(ws, validas[n_arriba:], RECUADROS_FOTO[-1]["fila"] + desplazamiento)
+    # Factura (si viene) en "Procurement Invoice", con su forma real; luego las demás fotos
+    anchas = list(facturas or ()) + validas[n_arriba:]
+    insertadas += _colocar_fotos_anchas(ws, anchas, RECUADROS_FOTO[-1]["fila"] + desplazamiento)
+    insertadas -= len(facturas or ())
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -422,7 +428,7 @@ def validar_campos_criticos(valores: dict) -> list:
     return [c for c in CAMPOS_CRITICOS if not valores.get(c)]
 
 
-def generar_reporte_byd(valores: dict, imagenes: list, ediciones: dict = None) -> tuple:
+def generar_reporte_byd(valores: dict, imagenes: list, ediciones: dict = None, facturas: list = None) -> tuple:
     """Devuelve (bytes_excel, faltantes, n_fotos_insertadas, info_peso). Nunca supera 25 MB."""
     faltantes = validar_campos_criticos(valores)
     plantilla = cargar_plantilla()
@@ -445,16 +451,17 @@ def generar_reporte_byd(valores: dict, imagenes: list, ediciones: dict = None) -
             logger.warning(f"No se pudo calcular el encuadre de {a.name}: {e}")
         fotos.append((a.name, datos, ed))
 
-    peso_base = len(_armar_excel(plantilla, valores, [])[0])
+    facturas = tuple(facturas or ())
+    peso_base = len(_armar_excel(plantilla, valores, [], facturas)[0])     # incluye la factura
     presupuesto = max(OBJETIVO_REPORTE_BYTES - peso_base - 4 * 1024 * len(fotos), 1 * MB)
     jpegs, info = comprimir_fotos_para_limite(fotos, presupuesto)
-    excel, insertadas = _armar_excel(plantilla, valores, jpegs)
+    excel, insertadas = _armar_excel(plantilla, valores, jpegs, facturas)
 
     intentos = 0
     while len(excel) > LIMITE_REPORTE_BYTES and intentos < 3 and fotos:
         presupuesto = max(presupuesto - (len(excel) - OBJETIVO_REPORTE_BYTES) - 512 * 1024, 1 * MB)
         jpegs, info = comprimir_fotos_para_limite(fotos, presupuesto)
-        excel, insertadas = _armar_excel(plantilla, valores, jpegs)
+        excel, insertadas = _armar_excel(plantilla, valores, jpegs, facturas)
         intentos += 1
 
     info.update({

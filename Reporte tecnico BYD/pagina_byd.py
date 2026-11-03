@@ -36,6 +36,7 @@ from byd.config import (  # noqa: E402
     TEMPLATE_FILENAME, PAIS_POR_DEFECTO, RECUADROS_FOTO, CAMPOS_MANUALES,
 )
 from byd.pdf import extraer_texto_pdf, extraer_valores_byd  # noqa: E402
+from byd.factura import factura_a_imagenes, miniatura as miniatura_factura  # noqa: E402
 from byd.archivos import (  # noqa: E402
     clasificar_archivos_subidos, clave_foto, huella, _es_imagen_valida, es_zip, expandir_zip,
 )
@@ -64,6 +65,15 @@ def _byd_texto_pdf(huella_archivo: str, _datos: bytes, nombre: str) -> str:
 
 def leer_pdf_cache(archivo) -> str:
     return _byd_texto_pdf(huella(archivo), archivo.getvalue(), archivo.name)
+
+
+@st.cache_data(show_spinner=False, max_entries=20)
+def _byd_factura(huella_archivo: str, _datos: bytes) -> list:
+    return factura_a_imagenes(_datos)
+
+
+def imagenes_factura(archivo) -> list:
+    return _byd_factura(huella(archivo), archivo.getvalue()) if archivo is not None else []
 
 
 @st.cache_data(show_spinner=False, max_entries=500)
@@ -189,12 +199,13 @@ with st.sidebar:
     st.markdown("### ℹ️ Cómo usar (BYD)")
     st.markdown(
         """
-        1. Sube `Orden de Trabajo.pdf`, `Trabajo en Garantías.pdf` y las fotos
-           (sueltos o en un **ZIP**). Nada es obligatorio.
+        1. Sube `Orden de Trabajo.pdf`, `Trabajo en Garantías.pdf`, `Factura.pdf`
+           y las fotos (sueltos o en un **ZIP**). Nada es obligatorio.
         2. Ordena las fotos arrastrándolas. Van así en el informe:
            - **1** → *Malfunction Point* (arriba izquierda)
            - **2** → *Parts Brand (Code)* (arriba derecha)
-           - **3** → *Procurement Invoice* (ancha)
+           - **3** → *Procurement Invoice* (ancha). Si subes `Factura.pdf`,
+             ahí va la factura con su tamaño real y las fotos siguen abajo
            - **4 en adelante** → filas nuevas a todo el ancho
            - desde la **3**: ancho completo, formato 3:2
         3. Revisa lo leído de los PDF y completa **a mano** (✍️):
@@ -389,6 +400,8 @@ def ordenar_por_nombre(imagenes: list) -> None:
 
 
 FOTOS_INFORME, FOTOS_FUERA = _sincronizar_fotos(clasificacion["imagenes"])
+FACTURAS = imagenes_factura(clasificacion["pdf_factura"])     # páginas de Factura.pdf como imagen
+HAY_FACTURA = bool(FACTURAS)
 
 st.markdown("#### 📎 Archivos detectados")
 badges = [
@@ -398,6 +411,10 @@ badges = [
     f'{clasificacion["pdf_orden_nombre"] or "no adjuntada"}</span>',
     f'<span class="byd-badge {"ok" if clasificacion["pdf_garantias"] else "warn"}">Trabajo en Garantías: '
     f'{clasificacion["pdf_garantias_nombre"] or "no adjuntada"}</span>',
+    f'<span class="byd-badge {"ok" if HAY_FACTURA else ""}">Factura: '
+    + (f'{clasificacion["pdf_factura_nombre"]} ✔' if HAY_FACTURA else
+       (f'{clasificacion["pdf_factura_nombre"]} (no se pudo leer)' if clasificacion["pdf_factura"] else
+        "no adjuntada (opcional)")) + '</span>',
     f'<span class="byd-badge {"ok" if FOTOS_INFORME else "warn"}">Fotos: {len(FOTOS_INFORME)}'
     + (f' (+{len(FOTOS_FUERA)} fuera del informe)' if FOTOS_FUERA else '') + '</span>',
 ]
@@ -502,7 +519,7 @@ def _editor_recorte(archivo) -> None:
     base = base_editor(archivo, rot)
     w, h = base.size
     indice = _indice_de(clave)
-    nombre, ayuda = nombre_recuadro(indice)
+    nombre, ayuda = nombre_recuadro(indice, HAY_FACTURA)
     proporcion = proporcion_para_indice(indice)
 
     st.caption(f"Foto {indice + 1} → **{nombre}** ({ayuda}). Arrastra las **esquinas** del recuadro "
@@ -567,10 +584,23 @@ else:
     _dialogo_recorte = None
 
 
+if HAY_FACTURA:
+    with st.expander(f"🧾 Factura → *Photo Of Parts Procurement Invoice* ({len(FACTURAS)} página(s), "
+                     "a todo el ancho y con su forma real) — clic para ver", expanded=False):
+        _cols_f = st.columns(min(len(FACTURAS), 3))
+        for _i, _jpg in enumerate(FACTURAS):
+            _cols_f[_i % len(_cols_f)].image(miniatura_factura(_jpg), use_container_width=True,
+                                             caption=f"Página {_i + 1}")
+elif clasificacion["pdf_factura"]:
+    st.warning(f"🧾 No se pudo convertir '{clasificacion['pdf_factura_nombre']}' en imagen; "
+               "el informe se generará sin la factura.")
+
 if clasificacion["imagenes"]:
     st.markdown("#### 🖼️ Fotos del Service Report")
     st.caption("Orden en el informe: **1** Malfunction Point · **2** Parts Brand (Code) · "
-               "**3** Procurement Invoice · **4+** filas adicionales. Cada foto **llena su recuadro**: "
+               + ("**Factura** en Procurement Invoice · **3+** filas adicionales. " if HAY_FACTURA else
+                  "**3** Procurement Invoice · **4+** filas adicionales. ") +
+               "Cada foto **llena su recuadro**: "
                "la 1 y la 2 arriba; desde la **3**, a todo el ancho en formato 3:2. Se recortan centradas y la "
                "vista previa muestra lo que saldrá; si quieres otro encuadre usa ✂️. ✂️ recortar · ↺ ↻ rotar · 🗑️ dejar fuera.")
     g2, g3, _ = st.columns([1.3, 1.3, 3.3])
@@ -594,7 +624,8 @@ if clasificacion["imagenes"]:
     ordenador = componente_ordenador()
     if ordenador is not None and len(FOTOS_INFORME) > 1:
         st.markdown("**🔀 Arrastra las fotos para cambiar el orden** · la 1 y la 2 (borde azul) van arriba en "
-                    "alta calidad; la 3 en el espacio de la factura")
+                    "alta calidad; " + ("la factura va sola en su espacio y las demás fotos debajo"
+                                        if HAY_FACTURA else "la 3 en el espacio de la factura"))
         items, firma = [], []
         for pos, a in enumerate(FOTOS_INFORME):
             ed = _edicion_de(clave_foto(a))
@@ -621,7 +652,7 @@ if clasificacion["imagenes"]:
             clave = clave_foto(archivo)
             ed = _edicion_de(clave)
             marcas = ([f"rotada {ed['rot']}°"] if ed.get("rot") else []) + (["recortada"] if ed.get("crop") else [])
-            nombre, ayuda = nombre_recuadro(i)
+            nombre, ayuda = nombre_recuadro(i, HAY_FACTURA)
             with columnas[j]:
                 try:
                     st.image(miniatura_jpeg(archivo, ed.get("rot", 0), crop_en_informe(archivo, i, ed), 480),
@@ -864,7 +895,8 @@ if generar:
     with st.spinner("Armando el Service Report…" if n_fotos <= 10 else
                     f"Armando el Service Report y optimizando {n_fotos} fotos…"):
         try:
-            excel_bytes, _, n_insertadas, info_peso = generar_reporte_byd(valores, FOTOS_INFORME, EDICIONES)
+            excel_bytes, _, n_insertadas, info_peso = generar_reporte_byd(valores, FOTOS_INFORME, EDICIONES,
+                                                                            facturas=FACTURAS)
         except Exception as e:
             st.error(f"No se pudo generar el Service Report: {e}")
             logger.error(f"Error generando el Service Report BYD: {e}")
@@ -876,9 +908,12 @@ if generar:
                        + ", ".join(ETIQUETAS.get(c, c) for c in faltantes))
         else:
             st.success("✅ Service Report generado con todos los campos importantes completos.")
-        if 0 < n_fotos < len(RECUADROS_FOTO):
+        _espacios = len(RECUADROS_FOTO) - (1 if HAY_FACTURA else 0)
+        if 0 < n_fotos < _espacios:
             st.info(f"Hay {n_fotos} foto(s): quedaron espacios de foto vacíos en el informe "
-                    f"(tiene {len(RECUADROS_FOTO)}).")
+                    f"(tiene {_espacios} para fotos).")
+        st.caption("🧾 Factura incluida en *Photo Of Parts Procurement Invoice*." if HAY_FACTURA else
+                   "🧾 Sin factura: no se adjuntó 'Factura.pdf' (el informe sale igual).")
 
         st.markdown("#### 📦 Peso del informe")
         c1, c2, c3 = st.columns(3)

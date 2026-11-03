@@ -11,7 +11,7 @@ from pathlib import PurePosixPath
 
 from PIL import Image as PILImage
 
-from .config import (logger, MB, EXTENSIONES_IMAGEN, NOMBRE_PDF_ORDEN, NOMBRES_PDF_GARANTIAS,
+from .config import (logger, MB, EXTENSIONES_IMAGEN, NOMBRE_PDF_ORDEN, NOMBRES_PDF_GARANTIAS, NOMBRE_PDF_FACTURA,
                      ZIP_MAX_DESCOMPRIMIDO, ZIP_MAX_ARCHIVO, ZIP_MAX_ELEMENTOS)
 from .pdf import extraer_texto_pdf
 
@@ -139,6 +139,8 @@ def clasificar_pdf(nombre: str) -> str:
         return "orden"
     if clave in NOMBRES_PDF_GARANTIAS:
         return "garantias"
+    if clave == NOMBRE_PDF_FACTURA or clave.startswith(NOMBRE_PDF_FACTURA + " "):
+        return "factura"
     return "ignorar"
 
 
@@ -171,6 +173,8 @@ def clasificar_archivos_subidos(archivos_subidos: list, leer_pdf=None, es_imagen
         "pdf_orden_nombre": "",
         "pdf_garantias": None,
         "pdf_garantias_nombre": "",
+        "pdf_factura": None,          # el archivo (se convierte en imagen, no se lee el texto)
+        "pdf_factura_nombre": "",
         "imagenes": [],
         "ignorados": [],
     }
@@ -188,6 +192,9 @@ def clasificar_archivos_subidos(archivos_subidos: list, leer_pdf=None, es_imagen
             elif tipo == "garantias" and resultado["pdf_garantias"] is None:
                 resultado["pdf_garantias"] = leer_pdf(archivo)
                 resultado["pdf_garantias_nombre"] = nombre
+            elif tipo == "factura" and resultado["pdf_factura"] is None:
+                resultado["pdf_factura"] = archivo
+                resultado["pdf_factura_nombre"] = nombre
             else:
                 resultado["ignorados"].append(nombre)
             continue
