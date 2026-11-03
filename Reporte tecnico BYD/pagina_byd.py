@@ -607,11 +607,13 @@ def cargar_lo_leido(vals: dict) -> None:
         st.session_state[K(f"campo_{campo}")] = vals.get(campo, "") or ""
 
 
-# Campos manuales y tablas: se crean vacíos UNA vez y se conservan aunque cambien los PDF
+# Campos manuales y tablas: se crean UNA vez y se conservan aunque cambien los PDF.
+# Se revisan uno por uno porque Streamlit borra el valor de un campo cuando deja de
+# mostrarse (p. ej. al ir a otra página); así Country vuelve siempre a "Chile".
+for _campo, _defecto in (("report_number", ""), ("country", PAIS_POR_DEFECTO), ("sales_date", None)):
+    if K(f"campo_{_campo}") not in st.session_state:
+        st.session_state[K(f"campo_{_campo}")] = _defecto
 if K("df_piezas") not in st.session_state:
-    st.session_state[K("campo_report_number")] = ""
-    st.session_state[K("campo_country")] = PAIS_POR_DEFECTO
-    st.session_state[K("campo_sales_date")] = None
     st.session_state[K("df_piezas")] = _tabla_vacia(COLS_PIEZA, 3)
     st.session_state[K("df_mo")] = _tabla_vacia(COLS_MO, 3)
     st.session_state[K("df_rep")] = _tabla_vacia(COLS_REP, 3)
@@ -669,6 +671,7 @@ if generar:
     for campo in CELDAS:
         v = st.session_state.get(K(f"campo_{campo}"), "")
         valores[campo] = v.strip() if isinstance(v, str) else v       # Sales Date es una fecha
+    valores["country"] = valores.get("country") or PAIS_POR_DEFECTO      # nunca queda vacío
     valores["piezas_falla"] = _df_a_lista(ed_piezas, COLS_PIEZA)[:3]
     valores["mano_obra"] = _df_a_lista(ed_mo, COLS_MO)[:3]
     valores["repuestos"] = _completar_totales(_df_a_lista(ed_rep, COLS_REP))
