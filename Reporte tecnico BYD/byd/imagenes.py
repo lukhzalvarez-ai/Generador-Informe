@@ -103,6 +103,9 @@ def comprimir_fotos_para_limite(fotos: list, presupuesto_bytes: int) -> tuple:
         for i in indices:
             nombre, datos, edicion = fotos[i]
             try:
+                if edicion and edicion.get("tal_cual") and nivel == 0:
+                    resultado[i] = datos        # foto de un informe anterior: se reutiliza tal cual
+                    continue
                 resultado[i] = codificar_imagen(datos, lado, calidad, edicion)
             except Exception as e:
                 logger.error(f"No se pudo procesar la imagen '{nombre}': {e}")

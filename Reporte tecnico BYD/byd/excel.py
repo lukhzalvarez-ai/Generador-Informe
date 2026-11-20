@@ -8,6 +8,7 @@
   - y no supera los 25 MB."""
 
 import io
+import json
 import re
 import copy
 import datetime
@@ -370,6 +371,22 @@ def _colocar_foto(ws, jpeg: bytes, fila: int, col_ini: str, col_fin: str) -> Non
 # --------------------------------------------------------------------------
 # Armado completo
 # --------------------------------------------------------------------------
+def _marcar_generador(wb, n_facturas: int) -> None:
+    """Marca interna (propiedad del documento, invisible en la hoja): permite que, si este
+    informe se vuelve a adjuntar para completarlo, la app sepa cuáles imágenes son la factura."""
+    try:
+        from openpyxl.packaging.custom import StringProperty
+        from .previo import PROPIEDAD_GENERADOR
+        props = wb.custom_doc_props
+        for p in list(props.props):
+            if p.name == PROPIEDAD_GENERADOR:
+                props.props.remove(p)
+        props.append(StringProperty(name=PROPIEDAD_GENERADOR,
+                                    value=json.dumps({"v": 1, "facturas": n_facturas})))
+    except Exception as e:
+        logger.warning(f"No se pudo marcar el informe: {e}")
+
+
 def _armar_excel(plantilla: bytes, valores: dict, imagenes_jpeg: list, facturas: tuple = ()) -> tuple:
     wb = openpyxl.load_workbook(io.BytesIO(plantilla))
     ws = wb.active
@@ -418,6 +435,7 @@ def _armar_excel(plantilla: bytes, valores: dict, imagenes_jpeg: list, facturas:
     anchas = list(facturas or ()) + validas[n_arriba:]
     insertadas += _colocar_fotos_anchas(ws, anchas, RECUADROS_FOTO[-1]["fila"] + desplazamiento)
     insertadas -= len(facturas or ())
+    _marcar_generador(wb, len(facturas or ()))
 
     buffer = io.BytesIO()
     wb.save(buffer)
@@ -449,6 +467,12 @@ def generar_reporte_byd(valores: dict, imagenes: list, ediciones: dict = None, f
                 ed["crop"] = encuadre_relleno(w, h, ed.get("crop"), proporcion_para_indice(i), libre)
         except Exception as e:
             logger.warning(f"No se pudo calcular el encuadre de {a.name}: {e}")
+        # Foto que viene de un informe anterior, sin cambios: se reutiliza tal cual (ya está
+        # comprimida; volver a comprimirla solo le quitaría calidad).
+        crop = ed.get("crop")
+        if (getattr(a, "del_informe", False) and not ed.get("rot") and datos[:2] == b"\xff\xd8"
+                and (not crop or all(abs(x - y) < 0.01 for x, y in zip(crop, (0, 0, 1, 1))))):
+            ed["tal_cual"] = True
         fotos.append((a.name, datos, ed))
 
     facturas = tuple(facturas or ())

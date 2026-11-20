@@ -37,6 +37,8 @@ from byd.config import (  # noqa: E402
 )
 from byd.pdf import extraer_texto_pdf, extraer_valores_byd  # noqa: E402
 from byd.factura import factura_a_imagenes, miniatura as miniatura_factura  # noqa: E402
+from byd.previo import es_informe_byd, leer_informe_byd  # noqa: E402
+from byd.archivos import ArchivoEnMemoria  # noqa: E402
 from byd.archivos import (  # noqa: E402
     clasificar_archivos_subidos, clave_foto, huella, _es_imagen_valida, es_zip, expandir_zip,
 )
@@ -79,6 +81,21 @@ def imagenes_factura(archivo) -> list:
 @st.cache_data(show_spinner=False, max_entries=500, ttl=7200)
 def _byd_imagen_valida(huella_archivo: str, _datos: bytes) -> bool:
     return _es_imagen_valida(_datos)
+
+
+@st.cache_data(show_spinner=False, max_entries=50, ttl=7200)
+def _byd_es_informe(huella_archivo: str, _datos: bytes) -> bool:
+    return es_informe_byd(_datos)
+
+
+def es_informe_cache(archivo) -> bool:
+    return _byd_es_informe(huella(archivo), archivo.getvalue())
+
+
+# cache_resource: el informe leído (con sus fotos) se comparte sin copiarlo en cada clic.
+@st.cache_resource(show_spinner="Leyendo el informe anterior…", max_entries=4, ttl=3600)
+def _byd_leer_informe(huella_archivo: str, _datos: bytes, nombre: str) -> dict:
+    return leer_informe_byd(_datos, nombre)
 
 
 def imagen_valida_cache(archivo) -> bool:
@@ -223,6 +240,10 @@ with st.sidebar:
            Report Number, Country, Sales Date, pieza en falla,
            mano de obra y repuestos.
         4. Genera y descarga el Service Report.
+
+        **¿Completar un informe ya hecho?** Adjunta el Service Report
+        a medio llenar (.xlsx) junto con las fotos o la factura nuevas:
+        se cargan sus textos, tablas y fotos para terminarlo.
         """
     )
     st.caption("Formatos de foto: " + ", ".join(sorted(EXTENSIONES_IMAGEN)).upper())
@@ -278,6 +299,8 @@ def recuperar_borrador() -> None:
     st.session_state[K("excl_preferido")] = fotos.get("excluidas") or {}
     if d.get("firma_pdfs"):
         st.session_state[K("firma_pdfs")] = d["firma_pdfs"]
+    if d.get("firma_previo"):
+        st.session_state[K("firma_previo")] = d["firma_previo"]
     st.session_state[K("archivos_por_adjuntar")] = d.get("archivos") or []
 
 
@@ -326,8 +349,8 @@ with _col_reset:
 
 with _col_carga:
     archivos_subidos = st.file_uploader(
-        "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf' y/o fotos, sueltos o en un ZIP "
-        "(todo opcional; lo demás se ignora)",
+        "Adjunta aquí: 'Orden de Trabajo.pdf', 'Trabajo en Garantías.pdf', 'Factura.pdf', fotos y/o un "
+        "Service Report BYD anterior (.xlsx) para completarlo; sueltos o en un ZIP (todo opcional; lo demás se ignora)",
         accept_multiple_files=True,
         key=K(f"cargador_{st.session_state.get(K('n_cargador'), 0)}"),
     )
@@ -338,8 +361,33 @@ if archivos_subidos and _por_adjuntar:
         st.session_state.pop(K("archivos_por_adjuntar"), None)
 archivos_expandidos, IGNORADOS_EN_ZIP, AVISOS_ZIP, RESUMEN_ZIPS = expandir_subidos(archivos_subidos or [])
 clasificacion = clasificar_archivos_subidos(archivos_expandidos, leer_pdf=leer_pdf_cache,
-                                             es_imagen=imagen_valida_cache)
+                                             es_imagen=imagen_valida_cache, es_informe=es_informe_cache)
 clasificacion["ignorados"] += IGNORADOS_EN_ZIP
+
+# --------------------------------------------------------------------------
+# Informe anterior (a medio completar): se reutilizan sus textos, tablas, fotos y factura
+# --------------------------------------------------------------------------
+PREVIO = None
+FIRMA_PREVIO = ""
+if clasificacion["informe_previo"] is not None:
+    _ip = clasificacion["informe_previo"]
+    FIRMA_PREVIO = huella(_ip)
+    try:
+        PREVIO = _byd_leer_informe(FIRMA_PREVIO, _ip.getvalue(), _ip.name)
+    except Exception as e:
+        logger.error(f"No se pudo leer el informe anterior: {e}")
+        st.error(f"No se pudo leer '{_ip.name}' como Service Report BYD.")
+        PREVIO = None
+FACTURA_PREVIA_OK = st.session_state.get(K("previo_factura_ok"), True)
+if PREVIO:
+    _fotos_previas = list(PREVIO["fotos"])
+    if PREVIO["facturas"] and PREVIO["factura_por_forma"] and not FACTURA_PREVIA_OK:
+        # El usuario indicó que esa "hoja" no es la factura: se trata como foto más
+        for _i, _b in enumerate(PREVIO["facturas"], start=1):
+            _h = ArchivoEnMemoria(f"Informe anterior · hoja {_i:02d}.jpg", _b, origen=PREVIO.get("nombre", ""))
+            _h.del_informe = True
+            _fotos_previas.append(_h)
+    clasificacion["imagenes"] = _fotos_previas + clasificacion["imagenes"]
 
 
 # --------------------------------------------------------------------------
@@ -412,6 +460,10 @@ def ordenar_por_nombre(imagenes: list) -> None:
 
 FOTOS_INFORME, FOTOS_FUERA = _sincronizar_fotos(clasificacion["imagenes"])
 FACTURAS = imagenes_factura(clasificacion["pdf_factura"])     # páginas de Factura.pdf como imagen
+FACTURA_DEL_INFORME = False
+if not FACTURAS and PREVIO and PREVIO["facturas"] and (FACTURA_PREVIA_OK or not PREVIO["factura_por_forma"]):
+    FACTURAS = list(PREVIO["facturas"])          # la factura que ya traía el informe anterior
+    FACTURA_DEL_INFORME = True
 HAY_FACTURA = bool(FACTURAS)
 
 st.markdown("#### 📎 Archivos detectados")
@@ -422,22 +474,36 @@ badges = [
     f'{clasificacion["pdf_orden_nombre"] or "no adjuntada"}</span>',
     f'<span class="byd-badge {"ok" if clasificacion["pdf_garantias"] else "warn"}">Trabajo en Garantías: '
     f'{clasificacion["pdf_garantias_nombre"] or "no adjuntada"}</span>',
+    *([f'<span class="byd-badge ok">Informe anterior: {clasificacion["informe_previo_nombre"]} ✔</span>']
+      if PREVIO else []),
     f'<span class="byd-badge {"ok" if HAY_FACTURA else ""}">Factura: '
-    + (f'{clasificacion["pdf_factura_nombre"]} ✔' if HAY_FACTURA else
+    + ("del informe anterior ✔" if FACTURA_DEL_INFORME else
+       f'{clasificacion["pdf_factura_nombre"]} ✔' if HAY_FACTURA else
        (f'{clasificacion["pdf_factura_nombre"]} (no se pudo leer)' if clasificacion["pdf_factura"] else
         "no adjuntada (opcional)")) + '</span>',
     f'<span class="byd-badge {"ok" if FOTOS_INFORME else "warn"}">Fotos: {len(FOTOS_INFORME)}'
     + (f' (+{len(FOTOS_FUERA)} fuera del informe)' if FOTOS_FUERA else '') + '</span>',
 ]
 st.markdown(" ".join(badges), unsafe_allow_html=True)
+if PREVIO:
+    st.info(f"📄 **Informe anterior cargado** ('{clasificacion['informe_previo_nombre']}'): sus textos, fechas, "
+            f"tablas, {len(PREVIO['fotos'])} foto(s)" + (" y la factura" if PREVIO["facturas"] else "") +
+            ". Las fotos nuevas que adjuntes quedan **después** (arrástralas si quieres otro orden)"
+            + ("; la Factura.pdf nueva reemplaza a la anterior" if clasificacion["pdf_factura"] and PREVIO["facturas"]
+               else "") +
+            ". Si también subes la OT o Garantías, solo se actualizan VIN, Model, fechas y kilometraje; "
+            "Fault Description, Troubleshooting y Repair Measure se mantienen.")
+    if PREVIO["avisos"]:
+        st.warning("No se encontraron en el informe anterior: " + ", ".join(PREVIO["avisos"]) +
+                   ". Complétalos a mano.")
 if RESUMEN_ZIPS:
     st.caption("📦 " + " · ".join(f"{n}: {k} archivo(s) útil(es) extraído(s)" for n, k in RESUMEN_ZIPS))
 for aviso in AVISOS_ZIP:
     st.warning(f"📦 {aviso}")
 if clasificacion["ignorados"]:
     with st.expander(f"🚫 {len(clasificacion['ignorados'])} archivo(s) ignorado(s) por no corresponder (clic para ver)"):
-        st.caption("Solo se usan los PDF llamados exactamente 'Orden de Trabajo' y 'Trabajo en Garantías', "
-                   "y las fotos. Si un PDF que necesitas aparece aquí, cámbiale el nombre y vuelve a subirlo.")
+        st.caption("Solo se usan los PDF llamados 'Orden de Trabajo', 'Trabajo en Garantías' y 'Factura', "
+                   "un Service Report BYD anterior (.xlsx) y las fotos. Si un PDF que necesitas aparece aquí, cámbiale el nombre y vuelve a subirlo.")
         st.markdown("\n".join(f"- {n}" for n in clasificacion["ignorados"]))
 
 
@@ -595,8 +661,14 @@ else:
     _dialogo_recorte = None
 
 
+if PREVIO and PREVIO["facturas"] and PREVIO["factura_por_forma"] and not clasificacion["pdf_factura"]:
+    st.checkbox("🧾 La hoja vertical del espacio *Procurement Invoice* del informe anterior es la factura",
+                value=True, key=K("previo_factura_ok"),
+                help="Se reconoció por su forma (el informe es de antes de la marca interna). "
+                     "Desmárcalo si en realidad es una foto: pasará a la grilla de fotos.")
 if HAY_FACTURA:
-    with st.expander(f"🧾 Factura → *Photo Of Parts Procurement Invoice* ({len(FACTURAS)} página(s), "
+    with st.expander(f"🧾 Factura{' (del informe anterior)' if FACTURA_DEL_INFORME else ''} → "
+                     f"*Photo Of Parts Procurement Invoice* ({len(FACTURAS)} página(s), "
                      "a todo el ancho y con su forma real) — clic para ver", expanded=False):
         _cols_f = st.columns(min(len(FACTURAS), 3))
         for _i, _jpg in enumerate(FACTURAS):
@@ -780,17 +852,68 @@ if K("df_piezas") not in st.session_state:
 firma_pdfs = hashlib.md5(((clasificacion["pdf_orden"] or "") + "\x00" +
                           (clasificacion["pdf_garantias"] or "")).encode("utf-8")).hexdigest()
 HAY_PDFS = bool(clasificacion["pdf_orden"] or clasificacion["pdf_garantias"])
+
+
+def aplicar_pdf_sobre_informe(vals: dict) -> None:
+    """Con informe anterior: los PDF solo actualizan VIN, Model, fechas y km (si traen dato).
+    Fault Description, Troubleshooting y Repair Measure NO se tocan."""
+    for campo in CAMPOS_AUTO:
+        v = _valor_leido(vals, campo)
+        if v:
+            st.session_state[K(f"campo_{campo}")] = v
+
+
+def cargar_informe_previo(previo: dict) -> None:
+    for campo, v in previo["campos"].items():
+        if campo == "country":
+            v = v or PAIS_POR_DEFECTO
+        st.session_state[K(f"campo_{campo}")] = v
+    for filas, cols, clave_df, clave_ed, minimo in (
+            (previo["piezas"], COLS_PIEZA, "df_piezas", "ed_piezas", 3),
+            (previo["mano_obra"], COLS_MO, "df_mo", "ed_mo", 3),
+            (previo["repuestos"], COLS_REP, "df_rep", "ed_rep", 3)):
+        df = _tabla_vacia(cols, max(minimo, len(filas)))
+        for i, fila in enumerate(filas):
+            for j, v in enumerate(fila[:len(cols)]):
+                df.iloc[i, j] = v
+        st.session_state[K(clave_df)] = df
+        st.session_state.pop(K(clave_ed), None)
+    # Fotos del informe primero; las que ya estaban subidas, después
+    del_informe = [clave_foto(a) for a in previo["fotos"]]
+    resto = [c for c in st.session_state.get(K("orden_fotos"), []) if c not in del_informe]
+    st.session_state[K("orden_fotos")] = del_informe + resto
+
+
+def volver_a_lo_leido() -> None:
+    if PREVIO:
+        aplicar_pdf_sobre_informe(VALORES_PDF)
+    else:
+        cargar_lo_leido(VALORES_PDF)
+
+
+# Informe anterior recién adjuntado: se cargan sus datos y, encima, lo que traigan los PDF
+if PREVIO and st.session_state.get(K("firma_previo")) != FIRMA_PREVIO:
+    cargar_informe_previo(PREVIO)
+    st.session_state[K("firma_previo")] = FIRMA_PREVIO
+    if HAY_PDFS:
+        aplicar_pdf_sobre_informe(VALORES_PDF)
+        st.session_state[K("firma_pdfs")] = firma_pdfs
+    st.rerun()      # para que la grilla de fotos tome el orden del informe
+
 # Se vuelve a leer de los PDF solo si cambiaron (y hay alguno): quitar los PDF o recuperar un
 # borrador sin volver a adjuntarlos no borra lo que ya está escrito.
 if HAY_PDFS and st.session_state.get(K("firma_pdfs")) != firma_pdfs:
-    cargar_lo_leido(VALORES_PDF)
+    if PREVIO:
+        aplicar_pdf_sobre_informe(VALORES_PDF)
+    else:
+        cargar_lo_leido(VALORES_PDF)
     st.session_state[K("firma_pdfs")] = firma_pdfs
 
 col_tit, col_btn = st.columns([4, 1])
 with col_tit:
     st.markdown("#### ✍️ Revisa y completa el Service Report")
 with col_btn:
-    st.button("↺ Volver a lo leído de los PDF", on_click=cargar_lo_leido, args=(VALORES_PDF,),
+    st.button("↺ Volver a lo leído de los PDF", on_click=volver_a_lo_leido,
               use_container_width=True, key=K("recargar_pdf"),
               help="Vuelve a poner lo que se leyó de los PDF. No borra lo que escribiste a mano.")
 st.caption("📄 = se lee de los PDF (texto tal cual, puedes corregirlo) · ✍️ = se llena a mano "
@@ -855,6 +978,7 @@ def _armar_borrador(tablas: dict) -> dict:
     excluidas = {k: v for k, v in st.session_state.get(K("fotos_excluidas"), {}).items()
                  if not str(v).startswith("duplicada")}
     return {"v": 1, "campos": campos, "tablas": filas, "firma_pdfs": firma_pdfs if HAY_PDFS else "",
+            "firma_previo": FIRMA_PREVIO,
             "archivos": [a.name for a in (archivos_subidos or [])],
             "fotos": {"orden": st.session_state.get(K("orden_fotos"), []), "excluidas": excluidas,
                       "ediciones": ediciones}}

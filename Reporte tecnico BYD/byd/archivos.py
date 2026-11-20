@@ -70,7 +70,7 @@ def expandir_zip(nombre_zip: str, datos: bytes) -> tuple:
                     or nombre.lower() in ("thumbs.db", "desktop.ini", ".ds_store"):
                 continue
             ext = nombre.lower().rsplit(".", 1)[-1] if "." in nombre else ""
-            if ext != "pdf" and ext not in EXTENSIONES_IMAGEN:
+            if ext != "pdf" and ext not in EXTENSIONES_IMAGEN and ext not in ("xlsx", "xlsm"):
                 ignorados.append(f"{nombre} (en {nombre_zip})")
                 continue
             if info.flag_bits & 0x1:
@@ -155,7 +155,7 @@ def _es_imagen_valida(datos: bytes) -> bool:
         return False
 
 
-def clasificar_archivos_subidos(archivos_subidos: list, leer_pdf=None, es_imagen=None) -> dict:
+def clasificar_archivos_subidos(archivos_subidos: list, leer_pdf=None, es_imagen=None, es_informe=None) -> dict:
     """Recibe la lista de UploadedFile del campo único (puede venir vacía)
     y se queda SOLO con:
       - el PDF llamado 'Orden de Trabajo'
@@ -175,9 +175,14 @@ def clasificar_archivos_subidos(archivos_subidos: list, leer_pdf=None, es_imagen
         "pdf_garantias_nombre": "",
         "pdf_factura": None,          # el archivo (se convierte en imagen, no se lee el texto)
         "pdf_factura_nombre": "",
+        "informe_previo": None,       # Service Report BYD a medio completar (.xlsx)
+        "informe_previo_nombre": "",
         "imagenes": [],
         "ignorados": [],
     }
+    if es_informe is None:
+        from .previo import es_informe_byd
+        es_informe = lambda a: es_informe_byd(a.getvalue())  # noqa: E731
     vistos_imagenes = set()
 
     for archivo in archivos_subidos:
@@ -195,6 +200,14 @@ def clasificar_archivos_subidos(archivos_subidos: list, leer_pdf=None, es_imagen
             elif tipo == "factura" and resultado["pdf_factura"] is None:
                 resultado["pdf_factura"] = archivo
                 resultado["pdf_factura_nombre"] = nombre
+            else:
+                resultado["ignorados"].append(nombre)
+            continue
+
+        if ext in ("xlsx", "xlsm"):
+            if resultado["informe_previo"] is None and es_informe(archivo):
+                resultado["informe_previo"] = archivo
+                resultado["informe_previo_nombre"] = nombre
             else:
                 resultado["ignorados"].append(nombre)
             continue
