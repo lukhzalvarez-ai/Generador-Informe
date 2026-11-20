@@ -27,6 +27,28 @@ import hashlib
 
 import streamlit as st
 import pandas as pd
+import sys
+from pathlib import Path as _Path
+
+# Al actualizar la app desde GitHub, Streamlit vuelve a ejecutar esta página pero puede
+# conservar en memoria la versión ANTERIOR del paquete 'reporte' (y fallar con errores como
+# "unexpected keyword argument"). Si algún archivo del paquete cambió, se descarga de
+# memoria para que se importe la versión nueva.
+def _refrescar_paquete(nombre: str, carpeta) -> None:
+    import os
+    try:
+        firma = tuple(sorted((f, os.path.getmtime(os.path.join(carpeta, f)))
+                             for f in os.listdir(carpeta) if f.endswith(".py")))
+    except OSError:
+        return
+    registro = sys.__dict__.setdefault("_firmas_paquetes_informe", {})
+    if registro.get(nombre) != firma:
+        for m in [m for m in sys.modules if m == nombre or m.startswith(nombre + ".")]:
+            del sys.modules[m]
+        registro[nombre] = firma
+
+
+_refrescar_paquete("reporte", str(_Path(__file__).resolve().parent / "reporte"))
 
 from reporte.config import (
     logger, MB, LIMITE_REPORTE_BYTES, N_FOTOS_PRIORITARIAS, CELDAS_EXCEL, ETIQUETAS_CAMPOS,

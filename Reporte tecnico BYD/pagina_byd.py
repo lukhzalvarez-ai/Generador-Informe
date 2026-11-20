@@ -31,6 +31,26 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # para importar el paquete 'byd'
 
+# Al actualizar la app desde GitHub, Streamlit vuelve a ejecutar esta página pero puede
+# conservar en memoria la versión ANTERIOR del paquete 'byd' (y fallar con errores como
+# "unexpected keyword argument"). Si algún archivo del paquete cambió, se descarga de
+# memoria para que se importe la versión nueva.
+def _refrescar_paquete(nombre: str, carpeta) -> None:
+    import os
+    try:
+        firma = tuple(sorted((f, os.path.getmtime(os.path.join(carpeta, f)))
+                             for f in os.listdir(carpeta) if f.endswith(".py")))
+    except OSError:
+        return
+    registro = sys.__dict__.setdefault("_firmas_paquetes_informe", {})
+    if registro.get(nombre) != firma:
+        for m in [m for m in sys.modules if m == nombre or m.startswith(nombre + ".")]:
+            del sys.modules[m]
+        registro[nombre] = firma
+
+
+_refrescar_paquete("byd", str(Path(__file__).resolve().parent / "byd"))
+
 from byd.config import (  # noqa: E402
     logger, MB, LIMITE_REPORTE_BYTES, N_FOTOS_PRIORITARIAS, CELDAS, ETIQUETAS, EXTENSIONES_IMAGEN,
     TEMPLATE_FILENAME, PAIS_POR_DEFECTO, RECUADROS_FOTO, CAMPOS_MANUALES,
